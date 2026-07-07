@@ -1,0 +1,15 @@
+__pycache__/
+*.pyc
+.pxcache/
+.pxcache
+# generated outputs / caches — regenerated on run, not shipped
+*_rows.json
+*_summary.json
+*_equity.json
+*_metrics.json
+*_trace.json
+*_state.pkl
+scorecard_*.json
+*.log
+# personal / training data — never publish
+batch_*.jsonl
