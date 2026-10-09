@@ -59,3 +59,7 @@ forward-walk · `run_ab.py` DTE A/B · `run_model_alpha.py` track 1 (constructio
 `run_model_alpha.py` prompts the model for a single trade as JSON and parses fields like
 `direction`, `entry_dte`, `long_delta`, `stop_pct`, `conviction`. Adapt the prompt/parse in
 `call_model` / the parsing helper to match whatever schema your model emits.
+
+## License
+
+MIT, see [LICENSE](LICENSE).
