@@ -14,11 +14,17 @@ Usage:
 Cached track outputs are reused so re-runs are cheap.
 """
 import argparse
+import hashlib
 import json
 import os
 import statistics as st
 
 HERE = os.path.dirname(os.path.abspath(__file__))
+CACHE_META_KEY = "_cache_meta"
+
+
+class CacheIntegrityError(ValueError):
+    """Raised when a cached track artifact does not match the requested identity."""
 
 
 def _load(path, default=None):
@@ -28,33 +34,103 @@ def _load(path, default=None):
     return default
 
 
-def run(name, base, model, start, end, step, skip_construction=False, skip_book=False,
-        doctrine_score=None):
-    from run_model_alpha import score as construction_score, summarize as construction_summ
-    from scenarios import generate
-    from book import Book
+def _write_json(path, payload, indent=2):
+    with open(path, "w") as f:
+        json.dump(payload, f, indent=indent)
 
+
+def _cache_identity(track, model, base, **params):
+    identity = {
+        "track": track,
+        "model": model,
+        "base": base,
+    }
+    for key, value in sorted(params.items()):
+        if value is not None:
+            identity[key] = value
+    return identity
+
+
+def _cache_fingerprint(identity):
+    canonical = json.dumps(identity, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    return hashlib.sha256(canonical).hexdigest()[:16]
+
+
+def _cache_tag(prefix, name, identity):
+    return f"{prefix}_{name}_{_cache_fingerprint(identity)}"
+
+
+def _validate_cache_entry(data, expected_identity, path):
+    if not isinstance(data, dict):
+        raise CacheIntegrityError(
+            f"Cache file {path} has invalid payload type {type(data).__name__}; expected dict"
+        )
+    meta = data.get(CACHE_META_KEY)
+    if not isinstance(meta, dict):
+        raise CacheIntegrityError(
+            f"Cache file {path} is missing required '{CACHE_META_KEY}' model identity metadata"
+        )
+    mismatches = []
+    for key in sorted(set(expected_identity) | set(meta)):
+        if meta.get(key) != expected_identity.get(key):
+            mismatches.append(
+                f"{key}: cached={meta.get(key)!r} != requested={expected_identity.get(key)!r}"
+            )
+    if mismatches:
+        raise CacheIntegrityError(
+            f"Cache identity mismatch in {path}: " + "; ".join(mismatches)
+        )
+    return {k: v for k, v in data.items() if k != CACHE_META_KEY}
+
+
+def _load_cached(path, expected_identity):
+    data = _load(path)
+    if data is None:
+        return None
+    return _validate_cache_entry(data, expected_identity, path)
+
+
+def _save_cached(path, payload, identity):
+    if not isinstance(payload, dict):
+        raise TypeError(f"Expected dict cache payload for {path}, got {type(payload).__name__}")
+    entry = dict(payload)
+    entry[CACHE_META_KEY] = dict(identity)
+    _write_json(path, entry, indent=2)
+
+
+def run(name, base, model, start, end, step, skip_construction=False, skip_book=False,
+        doctrine_score=None, cache_dir=None):
+    out_dir = HERE if cache_dir is None else cache_dir
     card = {"name": name, "model": model, "base": base}
 
-    # --- track 1: construction alpha (reuse cache if present) ---
-    ctag = f"model_alpha_{name}"
-    csum = _load(os.path.join(HERE, f"{ctag}_summary.json"))
+    # --- track 1: construction alpha (reuse cache only on exact model/config match) ---
+    c_identity = _cache_identity("construction_alpha", model, base)
+    ctag = _cache_tag("model_alpha", name, c_identity)
+    csum_path = os.path.join(out_dir, f"{ctag}_summary.json")
+    csum = _load_cached(csum_path, c_identity)
     if csum is None and not skip_construction:
+        from run_model_alpha import score as construction_score, summarize as construction_summ
+        from scenarios import generate
+
         setups = generate()
         rows = construction_score(setups, base, model)
         csum = construction_summ(rows)
-        json.dump(rows, open(os.path.join(HERE, f"{ctag}_rows.json"), "w"), indent=2)
-        json.dump(csum, open(os.path.join(HERE, f"{ctag}_summary.json"), "w"), indent=2)
+        _write_json(os.path.join(out_dir, f"{ctag}_rows.json"), rows, indent=2)
+        _save_cached(csum_path, csum, c_identity)
     card["construction_alpha"] = csum
 
-    # --- track 2: book backtest (reuse cache if present) ---
-    btag = f"book_{name}"
-    bsum = _load(os.path.join(HERE, f"{btag}_metrics.json"))
+    # --- track 2: book backtest (reuse cache only on exact model/config match) ---
+    b_identity = _cache_identity("book_backtest", model, base, start=start, end=end, step=step)
+    btag = _cache_tag("book", name, b_identity)
+    bsum_path = os.path.join(out_dir, f"{btag}_metrics.json")
+    bsum = _load_cached(bsum_path, b_identity)
     if bsum is None and not skip_book:
+        from book import Book
+
         b = Book(base, model, start, end, step)
         bsum = b.run()
-        json.dump(bsum, open(os.path.join(HERE, f"{btag}_metrics.json"), "w"), indent=2)
-        json.dump(b.equity_curve, open(os.path.join(HERE, f"{btag}_equity.json"), "w"))
+        _save_cached(bsum_path, bsum, b_identity)
+        _write_json(os.path.join(out_dir, f"{btag}_equity.json"), b.equity_curve, indent=None)
     card["book_backtest"] = bsum
 
     # --- track 3: doctrine rubric (attach if supplied) ---
@@ -62,7 +138,7 @@ def run(name, base, model, start, end, step, skip_construction=False, skip_book=
         card["doctrine_pct"] = doctrine_score
 
     card["headline"] = _headline(card)
-    json.dump(card, open(os.path.join(HERE, f"scorecard_{name}.json"), "w"), indent=2)
+    _write_json(os.path.join(out_dir, f"scorecard_{name}.json"), card, indent=2)
     return card
 
 
