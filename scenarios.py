@@ -28,7 +28,7 @@ def _twenty_day_ret(pre, entry_spot):
     return (closes[-1] - closes[-21]) / closes[-21]
 
 
-def generate(start="2024-01-15", end="2026-04-15", cadence_days=14, basket=BASKET):
+def generate(start="2024-01-15", end="2026-04-15", cadence_days=14, basket=BASKET, *, price_snapshot=None):
     """Yield dicts: {ticker, entry_date, direction, horizon_days, mom20}."""
     setups = []
     d = date.fromisoformat(start)
@@ -40,7 +40,12 @@ def generate(start="2024-01-15", end="2026-04-15", cadence_days=14, basket=BASKE
     for tk in basket:
         for ed in dates:
             try:
-                pre, fwd = path_from(tk, ed, days_forward=HORIZON_DAYS + 10)
+                pre, fwd = path_from(
+                    tk,
+                    ed,
+                    days_forward=HORIZON_DAYS + 10,
+                    price_snapshot=price_snapshot,
+                )
             except Exception:
                 continue
             if len(fwd) < 3 or len(pre) < 20:

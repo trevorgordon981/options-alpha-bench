@@ -293,8 +293,9 @@ class TestChronologicalTimelineAndSemanticActionsOP09OP10(unittest.TestCase):
         self.assertEqual(daily_dates, ["2025-01-02", "2025-01-03", "2025-01-06"])
         self.assertNotIn("2025-01-04", eq_dates)
         self.assertNotIn("2025-01-04", daily_dates)
-        # Decision snapshots remain tracked separately
-        self.assertEqual([d for d, _ in b.decision_equity_curve], ["2025-01-02", "2025-01-04", "2025-01-06"])
+        # Saturday 2025-01-04 defers to Monday 2025-01-06 (deduplicated) — never executed on Saturday (OP11)
+        self.assertEqual([d for d, _ in b.decision_equity_curve], ["2025-01-02", "2025-01-06"])
+        self.assertNotIn("2025-01-04", [d for d, _ in b.decision_equity_curve])
 
         # Weekend end date (Sunday 2025-01-05) must also be excluded in daily mode
         b_wknd_end = book.Book(
@@ -396,6 +397,143 @@ class TestChronologicalTimelineAndSemanticActionsOP09OP10(unittest.TestCase):
             [s["status"] for s in b.step_log],
             ["invalid_action", "schema_fail", "ok", "ok", "invalid_action"],
         )
+
+
+class TestTradingSessionSchedulingAndChronologyOP11(unittest.TestCase):
+    def test_friday_to_sunday_two_day_cadence_never_executes_sunday_or_inverts_exit_op11(self):
+        """OP11 exact repro: Fri 2025-01-03 -> Sun 2025-01-05 (step=2) must NOT execute Sunday or set exit < entry."""
+        px_series = {
+            "2024-12-02": 95.0,
+            "2024-12-09": 96.0,
+            "2024-12-16": 97.0,
+            "2024-12-23": 98.0,
+            "2024-12-30": 99.0,
+            "2025-01-02": 100.0,
+            "2025-01-03": 102.0,  # Fri: sole valid trading session in [2025-01-03, 2025-01-05]
+        }
+
+        def _fake_get_closes(ticker, start, end):
+            return {k: v for k, v in px_series.items() if start <= k <= end}
+
+        open_reply = (
+            '{"close": [], "open": [{"ticker": "NVDA", "direction": "long_call", '
+            '"entry_dte": 90, "long_delta": 0.60, "size_pct": 0.15}]}'
+        )
+        abstain_reply = '{"close": [], "open": []}'
+
+        # Exact audit scenario: abstain Friday, would have opened Sunday if Sunday were called
+        for freq in ("daily", "step"):
+            prompts_seen = []
+
+            def _responder_abstain_fri_open_second(prompt, max_tokens=1200):
+                prompts_seen.append(prompt)
+                return abstain_reply if len(prompts_seen) == 1 else open_reply
+
+            b = book.Book(
+                "http://127.0.0.1:8000",
+                "m",
+                start="2025-01-03",
+                end="2025-01-05",
+                step_days=2,
+                mark_frequency=freq,
+                verbose=False,
+                basket=["NVDA", "SPY"],
+            )
+            with mock.patch.object(book, "get_closes", side_effect=_fake_get_closes), \
+                 mock.patch.object(b, "_call", side_effect=_responder_abstain_fri_open_second):
+                m = b.run()
+
+            # Sunday 2025-01-05 MUST NOT be executed
+            self.assertEqual(len(prompts_seen), 1)
+            self.assertIn("Date: 2025-01-03", prompts_seen[0])
+            self.assertEqual(b.decision_schedule, ["2025-01-03"])
+            self.assertEqual(m["decision_steps"], 1)
+            self.assertEqual(m["n_trades"], 0)
+            self.assertEqual([s["date"] for s in b.step_log], ["2025-01-03"])
+            self.assertNotIn("2025-01-05", [d for d, _ in b.equity_curve])
+            self.assertNotIn("2025-01-05", [d for d, _ in b.daily_equity_curve])
+            self.assertNotIn("2025-01-05", [d for d, _ in b.decision_equity_curve])
+            self.assertTrue(all(p.exit_date >= p.entry_date for p in b.closed))
+
+            # Opening on Friday 2025-01-03 must also liquidate on >= entry_date (never earlier, never Sunday)
+            b_open = book.Book(
+                "http://127.0.0.1:8000",
+                "m",
+                start="2025-01-03",
+                end="2025-01-05",
+                step_days=2,
+                mark_frequency=freq,
+                verbose=False,
+                basket=["NVDA", "SPY"],
+            )
+            with mock.patch.object(book, "get_closes", side_effect=_fake_get_closes), \
+                 mock.patch.object(b_open, "_call", return_value=open_reply):
+                m_open = b_open.run()
+
+            self.assertEqual(m_open["n_trades"], 1)
+            p = b_open.closed[0]
+            self.assertEqual(p.entry_date, "2025-01-03")
+            self.assertEqual(p.exit_date, "2025-01-03")
+            self.assertGreaterEqual(p.exit_date, p.entry_date)
+
+    def test_weekend_cadence_defers_to_next_valid_session_within_window_op11(self):
+        """Nominal Sunday 2025-01-05 defers to Monday 2025-01-06 when Monday is inside [start, end]."""
+        px_series = {
+            "2024-12-02": 95.0,
+            "2024-12-09": 96.0,
+            "2024-12-16": 97.0,
+            "2024-12-23": 98.0,
+            "2024-12-30": 99.0,
+            "2025-01-02": 100.0,
+            "2025-01-03": 100.0,  # Fri
+            "2025-01-06": 110.0,  # Mon
+        }
+
+        def _fake_get_closes(ticker, start, end):
+            return {k: v for k, v in px_series.items() if start <= k <= end}
+
+        replies = [
+            '{"close": [], "open": []}',
+            '{"close": [], "open": [{"ticker": "NVDA", "direction": "long_call", "entry_dte": 90, "long_delta": 0.60, "size_pct": 0.15}]}',
+        ]
+        b = book.Book(
+            "http://127.0.0.1:8000",
+            "m",
+            start="2025-01-03",
+            end="2025-01-06",
+            step_days=2,  # Nominal: Fri Jan 3, Sun Jan 5 -> defers to Mon Jan 6
+            mark_frequency="daily",
+            verbose=False,
+            basket=["NVDA", "SPY"],
+        )
+        with mock.patch.object(book, "get_closes", side_effect=_fake_get_closes), \
+             mock.patch.object(b, "_call", side_effect=replies):
+            m = b.run()
+
+        self.assertEqual(b.decision_schedule, ["2025-01-03", "2025-01-06"])
+        self.assertEqual(m["decision_steps"], 2)
+        self.assertEqual(b.step_log[1]["date"], "2025-01-06")
+        self.assertEqual(b.step_log[1]["nominal_date"], "2025-01-05")
+        self.assertEqual(len(b.closed), 1)
+        self.assertEqual(b.closed[0].entry_date, "2025-01-06")
+        self.assertEqual(b.closed[0].exit_date, "2025-01-06")
+        self.assertGreaterEqual(b.closed[0].exit_date, b.closed[0].entry_date)
+
+    def test_close_guard_rejects_exit_date_earlier_than_entry_date_op11(self):
+        b = book.Book("http://127.0.0.1:8000", "m", verbose=False)
+        pos = book.Position(
+            pid="p1",
+            ticker="NVDA",
+            direction="long_call",
+            entry_date="2025-01-06",
+            expiry_ord=739300,
+            iv=0.40,
+            contracts=1,
+            entry_cost_ps=5.0,
+            legs={"long_k": 100.0},
+        )
+        with self.assertRaises(ValueError):
+            b._close(pos, "2025-01-03", 5.0, "final_liquidation")
 
 
 if __name__ == "__main__":

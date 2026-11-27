@@ -3,13 +3,18 @@
 Cache files store inclusive [start, end] metadata (`_start`, `_end`) and handle
 yfinance's end-exclusive download semantics by requesting `hi + 1 day`. Single-bar
 and MultiIndex DataFrame payloads are normalized without scalar `.squeeze()` defects.
+Runs can freeze an immutable in-memory `PriceSnapshot` so mid-run mutations to on-disk
+cache files cannot cause mixed price consumption or provenance digest drift.
 """
+from contextlib import contextmanager
+from contextvars import ContextVar
 from datetime import date, timedelta
 import hashlib
 import json
 import math
 import os
 import tempfile
+from types import MappingProxyType
 
 try:
     import yfinance as yf
@@ -20,6 +25,10 @@ CACHE_SCHEMA_VERSION = 2
 CACHE_DIR = os.environ.get(
     "BYRON_CACHE",
     os.path.join(os.path.dirname(os.path.abspath(__file__)), ".pxcache"),
+)
+
+_ACTIVE_SNAPSHOT: ContextVar["PriceSnapshot | None"] = ContextVar(
+    "_ACTIVE_SNAPSHOT", default=None
 )
 
 
@@ -97,11 +106,139 @@ def _extract_close_series(df, ticker: str | None = None) -> dict[str, float]:
     return out
 
 
-def get_closes(ticker: str, start: str, end: str) -> dict[str, float]:
+def price_series_digest(series_by_ticker: dict[str, dict[str, float]]) -> str:
+    """Return deterministic SHA-256[:16] over canonical consumed {TICKER: {iso_date: close}}."""
+    h = hashlib.sha256()
+    for tk in sorted(series_by_ticker):
+        bars = series_by_ticker[tk]
+        if not bars:
+            continue
+        clean = {
+            str(d): round(float(v), 4)
+            for d, v in sorted(bars.items())
+            if not str(d).startswith("_")
+            and isinstance(v, (int, float))
+            and not isinstance(v, bool)
+            and math.isfinite(float(v))
+        }
+        if not clean:
+            continue
+        h.update(tk.upper().encode("utf-8"))
+        h.update(b"\0")
+        h.update(json.dumps(clean, sort_keys=True, separators=(",", ":")).encode("utf-8"))
+        h.update(b"\n")
+    return h.hexdigest()[:16]
+
+
+class PriceSnapshot:
+    """Immutable in-memory snapshot of daily-close series with an exact content digest.
+
+    Once hydrated, all lookups (`get_closes`, `path_from`) read strictly from the frozen
+    in-memory bars — immune to any mid-run mutation of on-disk cache files.
+    """
+
+    def __init__(self, series_by_ticker: dict[str, dict[str, float]] | None = None):
+        frozen: dict[str, MappingProxyType] = {}
+        if series_by_ticker:
+            for tk, bars in series_by_ticker.items():
+                if not bars:
+                    continue
+                clean = {
+                    str(d): round(float(v), 4)
+                    for d, v in sorted(bars.items())
+                    if not str(d).startswith("_")
+                    and isinstance(v, (int, float))
+                    and not isinstance(v, bool)
+                    and math.isfinite(float(v))
+                }
+                if clean:
+                    frozen[tk.upper()] = MappingProxyType(clean)
+        self._series: MappingProxyType = MappingProxyType(frozen)
+        self._digest: str = price_series_digest(frozen)
+
+    def __len__(self) -> int:
+        return len(self._series)
+
+    def __contains__(self, ticker: str) -> bool:
+        return str(ticker).upper() in self._series
+
+    def tickers(self) -> tuple[str, ...]:
+        return tuple(sorted(self._series))
+
+    def digest(self) -> str:
+        return self._digest
+
+    def get_closes(self, ticker: str, start: str, end: str) -> dict[str, float]:
+        bars = self._series.get(ticker.upper())
+        if not bars:
+            return {}
+        return {k: v for k, v in bars.items() if start <= k <= end}
+
+    def path_from(self, ticker: str, entry_date: str, days_forward: int = 220):
+        d0 = date.fromisoformat(entry_date)
+        start = (d0 - timedelta(days=45)).isoformat()
+        end = (d0 + timedelta(days=days_forward)).isoformat()
+        closes = self.get_closes(ticker, start, end)
+        items = sorted(closes.items())
+        pre = [(d, c) for d, c in items if d < entry_date]
+        fwd = [(d, c) for d, c in items if d >= entry_date]
+        return pre, fwd
+
+    def to_dict(self) -> dict[str, dict[str, float]]:
+        return {tk: dict(bars) for tk, bars in self._series.items()}
+
+    def subset(self, tickers) -> "PriceSnapshot":
+        wanted = {str(tk).upper() for tk in tickers}
+        return PriceSnapshot({tk: dict(self._series[tk]) for tk in sorted(wanted) if tk in self._series})
+
+
+@contextmanager
+def use_price_snapshot(snapshot: "PriceSnapshot | None"):
+    """Bind an immutable PriceSnapshot for all data lookups in this execution context."""
+    token = _ACTIVE_SNAPSHOT.set(snapshot)
+    try:
+        yield snapshot
+    finally:
+        _ACTIVE_SNAPSHOT.reset(token)
+
+
+def active_price_snapshot() -> "PriceSnapshot | None":
+    return _ACTIVE_SNAPSHOT.get()
+
+
+def _read_cached_bars_file(path: str) -> dict[str, float]:
+    if not os.path.isfile(path):
+        return {}
+    with open(path, encoding="utf-8") as f:
+        payload = json.load(f)
+    if not isinstance(payload, dict):
+        return {}
+    return {
+        str(k): round(float(v), 4)
+        for k, v in payload.items()
+        if not str(k).startswith("_")
+        and isinstance(v, (int, float))
+        and not isinstance(v, bool)
+        and math.isfinite(float(v))
+    }
+
+
+def get_closes(
+    ticker: str,
+    start: str,
+    end: str,
+    *,
+    price_snapshot: "PriceSnapshot | None" = None,
+) -> dict[str, float]:
     """Return {isodate: close} for inclusive [start, end], split/div-adjusted.
 
-    Cached per ticker over a wide window so overlapping requests reuse one download.
+    When a `PriceSnapshot` is provided or active via `use_price_snapshot()`, serves
+    strictly from the frozen in-memory snapshot without touching on-disk cache files.
     """
+    snap = price_snapshot if price_snapshot is not None else _ACTIVE_SNAPSHOT.get()
+    if snap is not None:
+        return snap.get_closes(ticker, start, end)
+
     ticker = ticker.upper()
     cp = _cache_path(ticker)
     cache = {}
@@ -150,9 +287,21 @@ def get_closes(ticker: str, start: str, end: str) -> dict[str, float]:
     return {k: v for k, v in cache.items() if not k.startswith("_") and start <= k <= end}
 
 
-def path_from(ticker: str, entry_date: str, days_forward: int = 220):
+_DEFAULT_GET_CLOSES = get_closes
+
+
+def path_from(
+    ticker: str,
+    entry_date: str,
+    days_forward: int = 220,
+    *,
+    price_snapshot: "PriceSnapshot | None" = None,
+):
     """Ordered list of (isodate, close) starting at/after entry_date, plus the
     trailing window before entry_date (for realized-vol / IV estimation)."""
+    snap = price_snapshot if price_snapshot is not None else _ACTIVE_SNAPSHOT.get()
+    if snap is not None:
+        return snap.path_from(ticker, entry_date, days_forward=days_forward)
     d0 = date.fromisoformat(entry_date)
     start = (d0 - timedelta(days=45)).isoformat()
     end = (d0 + timedelta(days=days_forward)).isoformat()
@@ -161,6 +310,63 @@ def path_from(ticker: str, entry_date: str, days_forward: int = 220):
     pre = [(d, c) for d, c in items if d < entry_date]
     fwd = [(d, c) for d, c in items if d >= entry_date]
     return pre, fwd
+
+
+def load_cache_snapshot(cache_dir: str | None = None) -> PriceSnapshot:
+    """Load all cached price series from `cache_dir` into an immutable PriceSnapshot."""
+    root = cache_dir if cache_dir is not None else _get_cache_dir()
+    series: dict[str, dict[str, float]] = {}
+    if os.path.isdir(root):
+        for name in sorted(os.listdir(root)):
+            if not name.endswith(".json"):
+                continue
+            path = os.path.join(root, name)
+            if not os.path.isfile(path):
+                continue
+            tk = os.path.splitext(name)[0].upper()
+            try:
+                bars = _read_cached_bars_file(path)
+            except Exception:
+                continue
+            if bars:
+                series[tk] = bars
+    return PriceSnapshot(series)
+
+
+def hydrate_price_snapshot(
+    ticker_windows: dict[str, tuple[str, str]],
+    *,
+    get_closes_fn=None,
+) -> PriceSnapshot:
+    """Hydrate requested ticker windows ONCE and freeze them into an immutable PriceSnapshot.
+
+    When using the default disk/yfinance loader, all cached bars for each hydrated ticker
+    are captured once so subsequent lookups (even at wider DTEs) never re-read mutable
+    on-disk cache files.
+    """
+    fn = get_closes_fn if get_closes_fn is not None else get_closes
+    is_default_loader = (fn is _DEFAULT_GET_CLOSES) and (get_closes is _DEFAULT_GET_CLOSES)
+    series: dict[str, dict[str, float]] = {}
+
+    with use_price_snapshot(None):
+        for raw_tk in sorted(ticker_windows):
+            lo, hi = ticker_windows[raw_tk]
+            tk = str(raw_tk).upper()
+            try:
+                fetched = fn(tk, lo, hi)
+            except Exception:
+                continue
+            merged: dict[str, float] = {}
+            if is_default_loader:
+                try:
+                    merged.update(_read_cached_bars_file(_cache_path(tk)))
+                except Exception:
+                    pass
+            if isinstance(fetched, dict):
+                merged.update(fetched)
+            if merged:
+                series[tk] = merged
+    return PriceSnapshot(series)
 
 
 def load_fixture_into_cache(fixture_path: str, cache_dir: str) -> str:
@@ -189,23 +395,8 @@ def load_fixture_into_cache(fixture_path: str, cache_dir: str) -> str:
 
 
 def cache_manifest_digest(cache_dir: str | None = None) -> str:
-    """Return a deterministic SHA-256 prefix over all price cache files in cache_dir."""
-    root = cache_dir if cache_dir is not None else _get_cache_dir()
-    h = hashlib.sha256()
-    if not os.path.isdir(root):
-        return h.hexdigest()[:16]
-    for name in sorted(os.listdir(root)):
-        if not name.endswith(".json"):
-            continue
-        path = os.path.join(root, name)
-        if not os.path.isfile(path):
-            continue
-        h.update(name.encode("utf-8"))
-        h.update(b"\0")
-        with open(path, "rb") as f:
-            h.update(f.read())
-        h.update(b"\n")
-    return h.hexdigest()[:16]
+    """Return a deterministic SHA-256 prefix over canonical cached price series in cache_dir."""
+    return load_cache_snapshot(cache_dir).digest()
 
 
 if __name__ == "__main__":

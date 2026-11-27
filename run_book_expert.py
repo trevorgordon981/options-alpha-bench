@@ -18,7 +18,7 @@ from book import Book, MAX_CONCURRENT, _spot_on_or_before
 from market import slate as market_slate, context as market_context
 from scenarios import BASKET
 from expert_policy import expert_decision, cluster_of
-from data import get_closes
+from data import get_closes, use_price_snapshot
 
 START, END, STEP = "2024-02-01", "2026-04-15", 7
 
@@ -26,12 +26,15 @@ START, END, STEP = "2024-02-01", "2026-04-15", 7
 SPY_MA_DAYS = int(os.environ.get("EX_SPY_MA_DAYS", 100))
 
 
-def spy_trend(iso):
+def spy_trend(iso, *, price_snapshot=None):
     """SPY vs its N-day simple moving average as of `iso` (inclusive, no lookahead).
     Returns (spot, sma, below_ma_bool, gap_frac). All from cached closes."""
     d0 = date.fromisoformat(iso)
     start = (d0 - timedelta(days=int(SPY_MA_DAYS * 1.7) + 40)).isoformat()
-    closes = get_closes("SPY", start, iso)
+    if price_snapshot is not None:
+        closes = price_snapshot.get_closes("SPY", start, iso)
+    else:
+        closes = get_closes("SPY", start, iso)
     px = [v for k, v in sorted(closes.items()) if k <= iso]
     if len(px) < SPY_MA_DAYS:
         return (px[-1] if px else 0.0, None, False, 0.0)
@@ -49,7 +52,7 @@ def build_state(b, iso, equity, peak_equity):
     for p in b.positions:
         if p.closed:
             continue
-        spot = _spot_on_or_before(p.ticker, iso, b.px)
+        spot = _spot_on_or_before(p.ticker, iso, b.px, window_start=b.start, window_end=b.end)
         val_ps = p.value_ps(spot, d_ord)
         mktval = val_ps * 100 * p.contracts
         pos_mktval += mktval
@@ -62,12 +65,12 @@ def build_state(b, iso, equity, peak_equity):
             "mktval_frac": round(mktval / equity, 4) if equity else 0.0,
             "cluster": cluster_of(p.ticker),
         })
-    sl = market_slate(BASKET, iso, top=8)
+    sl = market_slate(BASKET, iso, top=8, price_snapshot=b.price_snapshot)
     for c in sl:
         c["cluster"] = cluster_of(c["ticker"])
-    spy_ctx = market_context("SPY", iso)
+    spy_ctx = market_context("SPY", iso, price_snapshot=b.price_snapshot)
     spy_r20 = spy_ctx["ret_20d"] if spy_ctx else 0.0
-    _spot, _sma, spy_below_ma, spy_ma_gap = spy_trend(iso)
+    _spot, _sma, spy_below_ma, spy_ma_gap = spy_trend(iso, price_snapshot=b.price_snapshot)
     return {
         "iso": iso, "equity": round(equity, 2), "cash": round(b.cash, 2),
         "peak_equity": round(peak_equity, 2),
@@ -82,82 +85,93 @@ def build_state(b, iso, equity, peak_equity):
 
 def main():
     b = Book(base="", model="rules_expert", start=START, end=END, step_days=STEP, verbose=False)
-    d = date.fromisoformat(START)
-    end_d = date.fromisoformat(END)
+    lookback = max(100, int(SPY_MA_DAYS * 1.7) + 45)
+    snapshot = b._prepare_snapshot(lookback_days=lookback)
     last_advanced_iso = None
     peak_equity = 0.0
     trace = []
 
-    while d <= end_d:
-        iso = d.isoformat()
-        if last_advanced_iso is None:
-            b._advance_sessions(START, iso, include_start=True)
-        else:
-            b._advance_sessions(last_advanced_iso, iso, include_start=False)
-        last_advanced_iso = iso
-        equity = b._mark_equity(iso)
-        b._record_equity(iso, equity, b.decision_equity_curve)
-        if b.mark_frequency == "step":
-            b._record_equity(iso, equity, b.equity_curve)
-        peak_equity = max(peak_equity, equity)
+    with use_price_snapshot(snapshot):
+        sessions = b._trading_sessions_between(START, END, include_start=True)
+        schedule = b._build_decision_schedule(sessions)
+        b.sessions = list(sessions)
+        b.decision_schedule = [exec_iso for exec_iso, _ in schedule]
 
-        state = build_state(b, iso, equity, peak_equity)
-        decision, reasoning = expert_decision(state)
-        b.decision_steps_run += 1
-        b.valid_decisions += 1
-        if not decision.get("close") and not decision.get("open"):
-            b.deliberate_abstentions += 1
-
-        # ---- apply closes ----
-        closed_report = []
-        for pid in decision.get("close", []) or []:
-            for p in b.positions:
-                if p.pid == pid and not p.closed:
-                    spot = _spot_on_or_before(p.ticker, iso, b.px)
-                    val = p.value_ps(spot, d.toordinal())
-                    pnl = (val - p.entry_cost_ps) / p.entry_cost_ps * 100 if p.entry_cost_ps else 0
-                    b._close(p, iso, val, "model_close")
-                    closed_report.append(f"{pid} {p.ticker} P&L {pnl:+.0f}%")
-
-        # ---- apply opens ----
-        nopen = len([p for p in b.positions if not p.closed])
-        opened_report = []
-        for spec in (decision.get("open", []) or []):
-            if nopen >= MAX_CONCURRENT:
-                opened_report.append(f"SKIP {spec.get('ticker')} (max)")
-                continue
-            p = b._open(iso, spec, equity)
-            if p:
-                cost = p.entry_cost_ps * 100 * p.contracts
-                opened_report.append(f"{p.pid} {p.ticker} {p.direction} x{p.contracts} "
-                                     f"cost=${cost:,.0f} ({cost/equity*100:.0f}%)")
-                nopen += 1
+        for iso, nominal_iso in schedule:
+            d_ord = date.fromisoformat(iso).toordinal()
+            if last_advanced_iso is None:
+                b._advance_sessions(START, iso, include_start=True)
             else:
-                opened_report.append(f"REJECT {spec.get('ticker')} {spec.get('direction')}")
+                b._advance_sessions(last_advanced_iso, iso, include_start=False)
+            last_advanced_iso = iso
+            equity = b._mark_equity(iso)
+            b._record_equity(iso, equity, b.decision_equity_curve)
+            if b.mark_frequency == "step":
+                b._record_equity(iso, equity, b.equity_curve)
+            peak_equity = max(peak_equity, equity)
 
-        trace.append({
-            "step": len(trace) + 1, "iso": iso, "state": state,
-            "decision": decision, "reasoning": reasoning,
-            "applied": {"closed": closed_report, "opened": opened_report,
-                        "cash_after": round(b.cash, 2)},
-        })
-        d += timedelta(days=STEP)
+            state = build_state(b, iso, equity, peak_equity)
+            decision, reasoning = expert_decision(state)
+            b.decision_steps_run += 1
+            b.valid_decisions += 1
+            if not decision.get("close") and not decision.get("open"):
+                b.deliberate_abstentions += 1
 
-    # ---- final liquidation (replace terminal mark cleanly) ----
-    fin = end_d.isoformat()
-    if last_advanced_iso is None:
-        b._advance_sessions(START, fin, include_start=True)
-    else:
-        b._advance_sessions(last_advanced_iso, fin, include_start=False)
-    for p in b.positions:
-        if not p.closed:
-            spot = _spot_on_or_before(p.ticker, fin, b.px)
-            b._close(p, fin, p.value_ps(spot, end_d.toordinal()), "final_liquidation")
-    b._record_equity(fin, b.cash, b.equity_curve)
-    if b.daily_equity_curve and b.daily_equity_curve[-1][0] == fin:
-        b._record_equity(fin, b.cash, b.daily_equity_curve)
+            # ---- apply closes ----
+            closed_report = []
+            for pid in decision.get("close", []) or []:
+                for p in b.positions:
+                    if p.pid == pid and not p.closed:
+                        spot = _spot_on_or_before(p.ticker, iso, b.px, window_start=START, window_end=END)
+                        val = p.value_ps(spot, d_ord)
+                        pnl = (val - p.entry_cost_ps) / p.entry_cost_ps * 100 if p.entry_cost_ps else 0
+                        b._close(p, iso, val, "model_close")
+                        closed_report.append(f"{pid} {p.ticker} P&L {pnl:+.0f}%")
 
-    m = b.metrics()
+            # ---- apply opens ----
+            nopen = len([p for p in b.positions if not p.closed])
+            opened_report = []
+            for spec in (decision.get("open", []) or []):
+                if nopen >= MAX_CONCURRENT:
+                    opened_report.append(f"SKIP {spec.get('ticker')} (max)")
+                    continue
+                p = b._open(iso, spec, equity)
+                if p:
+                    cost = p.entry_cost_ps * 100 * p.contracts
+                    opened_report.append(f"{p.pid} {p.ticker} {p.direction} x{p.contracts} "
+                                         f"cost=${cost:,.0f} ({cost/equity*100:.0f}%)")
+                    nopen += 1
+                else:
+                    opened_report.append(f"REJECT {spec.get('ticker')} {spec.get('direction')}")
+
+            entry = {
+                "step": len(trace) + 1, "iso": iso, "state": state,
+                "decision": decision, "reasoning": reasoning,
+                "applied": {"closed": closed_report, "opened": opened_report,
+                            "cash_after": round(b.cash, 2)},
+            }
+            if nominal_iso != iso:
+                entry["nominal_date"] = nominal_iso
+            trace.append(entry)
+
+        # ---- final liquidation on final valid trading session ----
+        if last_advanced_iso is None:
+            b._advance_sessions(START, END, include_start=True)
+        else:
+            b._advance_sessions(last_advanced_iso, END, include_start=False)
+        liq_iso = sessions[-1] if sessions else END
+        liq_ord = date.fromisoformat(liq_iso).toordinal()
+        for p in b.positions:
+            if not p.closed:
+                spot = _spot_on_or_before(p.ticker, liq_iso, b.px, window_start=START, window_end=END)
+                if spot is not None:
+                    b._close(p, liq_iso, p.value_ps(spot, liq_ord), "final_liquidation")
+        if sessions or b.daily_equity_curve:
+            b._record_equity(liq_iso, b.cash, b.equity_curve)
+            if b.daily_equity_curve and b.daily_equity_curve[-1][0] == liq_iso:
+                b._record_equity(liq_iso, b.cash, b.daily_equity_curve)
+
+        m = b.metrics()
     m["model"] = "rules_expert"
     with open("book_expert_metrics.json", "w") as f:
         json.dump(m, f, indent=2)

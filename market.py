@@ -6,11 +6,14 @@ from datetime import date, timedelta
 from data import get_closes
 
 
-def context(ticker, asof, lookback_days=90):
+def context(ticker, asof, lookback_days=90, *, price_snapshot=None):
     """Snapshot of what was knowable at `asof` (inclusive). Returns None if insufficient."""
     d0 = date.fromisoformat(asof)
     start = (d0 - timedelta(days=lookback_days)).isoformat()
-    closes = get_closes(ticker, start, asof)
+    if price_snapshot is not None:
+        closes = price_snapshot.get_closes(ticker, start, asof)
+    else:
+        closes = get_closes(ticker, start, asof)
     items = sorted((k, v) for k, v in closes.items() if k <= asof)
     if len(items) < 25:
         return None
@@ -34,12 +37,12 @@ def context(ticker, asof, lookback_days=90):
     }
 
 
-def slate(basket, asof, top=8):
+def slate(basket, asof, top=8, *, price_snapshot=None):
     """Candidate slate at `asof`: contexts sorted by |20d momentum| (most actionable first)."""
     ctx = []
     for t in basket:
         try:
-            c = context(t, asof)
+            c = context(t, asof, price_snapshot=price_snapshot)
         except Exception:
             c = None
         if c:

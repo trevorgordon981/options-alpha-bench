@@ -309,6 +309,193 @@ class TestCacheProvenanceAndCompareOP08(unittest.TestCase):
                 self.assertEqual(calls["book"], 1)
                 self.assertEqual(card2["provenance"]["book_backtest"]["data_digest"], post_digest)
 
+    def test_mid_run_cache_mutation_does_not_corrupt_construction_prices_or_digest_op08(self):
+        """OP08 exact repro: mutating NVDA.json ($100 -> $200) inside model callback must NOT alter consumed prices or data_digest."""
+        from datetime import date, timedelta
+        import run_model_alpha
+
+        px_dir = os.path.join(self.tmpdir.name, "px_mut_const")
+        out_dir = os.path.join(self.tmpdir.name, "out_mut_const")
+        os.makedirs(px_dir, exist_ok=True)
+        os.makedirs(out_dir, exist_ok=True)
+
+        # Build deterministic synthetic NVDA series: pre-window + entry 2025-01-02 @ $100 rising to $125 (+25%)
+        def _make_series(entry_px: float, end_px: float) -> dict:
+            bars = {}
+            d = date(2024, 11, 15)
+            while d <= date(2025, 2, 15):
+                if d.weekday() < 5:
+                    iso = d.isoformat()
+                    if iso < "2025-01-02":
+                        bars[iso] = entry_px
+                    elif iso == "2025-01-02":
+                        bars[iso] = entry_px
+                    else:
+                        bars[iso] = end_px
+                d += timedelta(days=1)
+            return {
+                "_schema_version": 2,
+                "_source": "synthetic_test",
+                "_fixture_sha256": "pinned-test-fixture",
+                "_start": "2024-11-15",
+                "_end": "2025-02-15",
+                **bars,
+            }
+
+        nvda_path = os.path.join(px_dir, "NVDA.json")
+        with open(nvda_path, "w", encoding="utf-8") as f:
+            json.dump(_make_series(100.0, 125.0), f, sort_keys=True)
+
+        with mock.patch.dict(os.environ, {"BYRON_CACHE": px_dir}):
+            digest_100 = data.cache_manifest_digest(px_dir)
+            prompts_seen = []
+            mutated = {"done": False}
+
+            def _mutating_model_call(prompt, base, model, **kwargs):
+                prompts_seen.append(prompt)
+                if not mutated["done"]:
+                    mutated["done"] = True
+                    # Mutate on-disk cache mid-run: $100 -> $200 entry, $125 -> $150 end (-25% instead of +25%)
+                    with open(nvda_path, "w", encoding="utf-8") as f:
+                        json.dump(_make_series(200.0, 150.0), f, sort_keys=True)
+                return json.dumps({
+                    "direction": "long_call",
+                    "entry_dte": 35,
+                    "long_delta": 0.60,
+                    "stop_pct": 0.30,
+                    "conviction": "high",
+                })
+
+            test_setups = [
+                {"ticker": "NVDA", "entry_date": "2025-01-02", "horizon_days": 21, "mom20": 0.10}
+            ]
+            with mock.patch("sys.stdout", new=io.StringIO()), \
+                 mock.patch.object(scenarios, "generate", return_value=test_setups), \
+                 mock.patch.object(run_model_alpha, "call_model", side_effect=_mutating_model_call):
+                card1 = bench.run(
+                    "mut_const",
+                    "http://127.0.0.1:8082",
+                    "model-v1",
+                    "2025-01-02",
+                    "2025-01-24",
+                    7,
+                    skip_book=True,
+                    cache_dir=out_dir,
+                    model_revision="sha256:rev1",
+                )
+
+            digest_200 = data.cache_manifest_digest(px_dir)
+            self.assertNotEqual(digest_100, digest_200)
+            self.assertEqual(len(prompts_seen), 1)
+            self.assertIn("Spot: $100.00", prompts_seen[0])
+
+            # Provenance digest MUST match the exact $100 snapshot consumed, NOT mutated $200 disk cache!
+            c_id = card1["provenance"]["construction_alpha"]
+            self.assertEqual(c_id["data_digest"], digest_100)
+            self.assertNotEqual(c_id["data_digest"], digest_200)
+
+            ctag = bench._cache_tag("model_alpha", "mut_const", c_id)
+            with open(os.path.join(out_dir, f"{ctag}_summary.json"), encoding="utf-8") as f:
+                cached_summary = json.load(f)
+            self.assertEqual(cached_summary[bench.CACHE_META_KEY]["data_digest"], digest_100)
+
+            with open(os.path.join(out_dir, f"{ctag}_rows.json"), encoding="utf-8") as f:
+                saved_rows = json.load(f)
+            self.assertEqual(len(saved_rows), 1)
+            # Underlying return MUST reflect the frozen $100 -> $125 (+25%) series, NOT mutated $200 -> $150 (-25%)!
+            self.assertAlmostEqual(saved_rows[0]["underlying_ret"], 0.25, places=4)
+            self.assertEqual(saved_rows[0]["data_digest"], digest_100)
+
+            # A subsequent run AFTER the disk mutation must miss the $100 cache and bind the new $200 digest
+            with mock.patch("sys.stdout", new=io.StringIO()), \
+                 mock.patch.object(scenarios, "generate", return_value=test_setups), \
+                 mock.patch.object(run_model_alpha, "call_model", side_effect=_mutating_model_call):
+                card2 = bench.run(
+                    "mut_const",
+                    "http://127.0.0.1:8082",
+                    "model-v1",
+                    "2025-01-02",
+                    "2025-01-24",
+                    7,
+                    skip_book=True,
+                    cache_dir=out_dir,
+                    model_revision="sha256:rev1",
+                )
+            self.assertEqual(len(prompts_seen), 2)
+            self.assertIn("Spot: $200.00", prompts_seen[1])
+            self.assertEqual(card2["provenance"]["construction_alpha"]["data_digest"], digest_200)
+
+    def test_mid_run_cache_mutation_does_not_corrupt_book_prices_or_digest_op08(self):
+        """OP08 exact repro for Track 2: mutating on-disk cache ($100 -> $200) mid-Book run cannot drift consumed prices or data_digest."""
+        from datetime import date, timedelta
+        import book as real_book
+
+        px_dir = os.path.join(self.tmpdir.name, "px_mut_book")
+        out_dir = os.path.join(self.tmpdir.name, "out_mut_book")
+        os.makedirs(px_dir, exist_ok=True)
+        os.makedirs(out_dir, exist_ok=True)
+
+        def _make_series(val_start: float, val_end: float) -> dict:
+            bars = {}
+            d = date(2024, 9, 1)
+            while d <= date(2025, 1, 20):
+                if d.weekday() < 5:
+                    iso = d.isoformat()
+                    bars[iso] = val_start if iso <= "2025-01-03" else val_end
+                d += timedelta(days=1)
+            return {
+                "_schema_version": 2,
+                "_source": "synthetic_test",
+                "_fixture_sha256": "pinned-test-fixture",
+                "_start": "2024-09-01",
+                "_end": "2025-01-20",
+                **bars,
+            }
+
+        for tk in ("SPY", "NVDA"):
+            with open(os.path.join(px_dir, f"{tk}.json"), "w", encoding="utf-8") as f:
+                json.dump(_make_series(100.0, 110.0), f, sort_keys=True)
+
+        with mock.patch.dict(os.environ, {"BYRON_CACHE": px_dir}):
+            digest_100 = data.cache_manifest_digest(px_dir)
+            prompts_seen = []
+
+            def _mutating_book_call(self_book, prompt, max_tokens=1200):
+                prompts_seen.append(prompt)
+                if len(prompts_seen) == 1:
+                    # Overwrite on-disk cache mid-run from $100/$110 to $200/$50!
+                    for tk in ("SPY", "NVDA"):
+                        with open(os.path.join(px_dir, f"{tk}.json"), "w", encoding="utf-8") as f:
+                            json.dump(_make_series(200.0, 50.0), f, sort_keys=True)
+                return '{"close": [], "open": []}'
+
+            with mock.patch("sys.stdout", new=io.StringIO()), \
+                 mock.patch.object(real_book.Book, "_call", _mutating_book_call):
+                card = bench.run(
+                    "mut_book",
+                    "http://127.0.0.1:8082",
+                    "model-v1",
+                    "2025-01-02",
+                    "2025-01-16",
+                    7,
+                    skip_construction=True,
+                    cache_dir=out_dir,
+                    model_revision="sha256:rev1",
+                )
+
+            digest_200 = data.cache_manifest_digest(px_dir)
+            self.assertNotEqual(digest_100, digest_200)
+            self.assertGreaterEqual(len(prompts_seen), 2)
+            # Even the SECOND step prompt (after disk mutation) MUST still see frozen $110, NOT mutated $50!
+            self.assertIn("$110.0", prompts_seen[1])
+            self.assertNotIn("$50.0", prompts_seen[1])
+            # SPY comparator MUST reflect frozen +10% (100 -> 110), NOT mutated -75% (200 -> 50)!
+            self.assertAlmostEqual(card["book_backtest"]["spy_buyhold_total_return_pct"], 10.0, places=1)
+            # Provenance digest MUST equal the frozen $100 snapshot digest, NOT mutated disk digest!
+            self.assertEqual(card["provenance"]["book_backtest"]["data_digest"], digest_100)
+            self.assertNotEqual(card["provenance"]["book_backtest"]["data_digest"], digest_200)
+            self.assertEqual(card["book_backtest"]["data_digest"], digest_100)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -73,9 +73,14 @@ def _entry_greeks(direction, spot, legs, t, iv):
     return delta, gamma, theta
 
 
-def simulate(trade: Trade) -> Result:
+def simulate(trade: Trade, *, price_snapshot=None) -> Result:
     try:
-        pre, fwd = path_from(trade.ticker, trade.entry_date, days_forward=trade.entry_dte + 30)
+        pre, fwd = path_from(
+            trade.ticker,
+            trade.entry_date,
+            days_forward=trade.entry_dte + 30,
+            price_snapshot=price_snapshot,
+        )
     except Exception as e:
         return Result(trade, False, err=f"data:{e}")
     if len(fwd) < 3:

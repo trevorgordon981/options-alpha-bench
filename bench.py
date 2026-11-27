@@ -217,6 +217,14 @@ def _accepts_kwarg(fn, name: str) -> bool:
     return any(p.kind == inspect.Parameter.VAR_KEYWORD for p in sig.parameters.values())
 
 
+def _accepts_explicit_kwarg(fn, name: str) -> bool:
+    try:
+        sig = inspect.signature(fn)
+    except (TypeError, ValueError):
+        return False
+    return name in sig.parameters
+
+
 def run(
     name,
     base,
@@ -266,33 +274,97 @@ def run(
     csum = _load_cached(pre_csum_path, pre_c_identity)
     c_identity = pre_c_identity
     if csum is None and not skip_construction:
-        from run_model_alpha import score as construction_score, summarize as construction_summ
+        import run_model_alpha as rma_mod
         from scenarios import generate
 
+        construction_score = rma_mod.score
+        construction_summ = rma_mod.summarize
+        hydrate_setups_fn = getattr(rma_mod, "hydrate_snapshot_for_setups", None)
+
         setups = generate()
-        pre_ckpt_path = os.path.join(out_dir, f"{pre_ctag}_cases.jsonl")
-        score_kwargs = {}
-        if _accepts_kwarg(construction_score, "allow_model_stop"):
-            score_kwargs["allow_model_stop"] = allow_model_stop
-        if _accepts_kwarg(construction_score, "checkpoint_path"):
-            score_kwargs["checkpoint_path"] = pre_ckpt_path
-        if _accepts_kwarg(construction_score, "api_key"):
-            score_kwargs["api_key"] = api_key
-        if _accepts_kwarg(construction_score, "api_key_env"):
-            score_kwargs["api_key_env"] = api_key_env
-        rows = construction_score(setups, base, model, **score_kwargs)
-        summ_kwargs = {}
-        if _accepts_kwarg(construction_summ, "min_coverage"):
-            summ_kwargs["min_coverage"] = min_coverage
-        csum = construction_summ(rows, **summ_kwargs)
-        # Recompute provenance digest AFTER cache hydration/updates (OP08)
-        c_identity = _cache_identity("construction_alpha", model, base, **c_params)
-        ctag = _cache_tag("model_alpha", name, c_identity)
-        csum_path = os.path.join(out_dir, f"{ctag}_summary.json")
-        if ctag != pre_ctag and os.path.exists(pre_ckpt_path):
-            os.replace(pre_ckpt_path, os.path.join(out_dir, f"{ctag}_cases.jsonl"))
-        _write_json(os.path.join(out_dir, f"{ctag}_rows.json"), rows, indent=2)
-        _save_cached(csum_path, csum, c_identity)
+        c_snapshot = None
+        if (
+            _accepts_explicit_kwarg(construction_score, "price_snapshot")
+            and callable(hydrate_setups_fn)
+        ):
+            c_snapshot = hydrate_setups_fn(setups)
+            if c_snapshot is not None and len(c_snapshot) > 0:
+                snap_c_identity = _cache_identity(
+                    "construction_alpha",
+                    model,
+                    base,
+                    data_digest=c_snapshot.digest(),
+                    **c_params,
+                )
+                snap_ctag = _cache_tag("model_alpha", name, snap_c_identity)
+                snap_csum_path = os.path.join(out_dir, f"{snap_ctag}_summary.json")
+                csum = _load_cached(snap_csum_path, snap_c_identity)
+                if csum is not None:
+                    c_identity = snap_c_identity
+
+        if csum is None:
+            active_ctag = (
+                _cache_tag(
+                    "model_alpha",
+                    name,
+                    _cache_identity(
+                        "construction_alpha",
+                        model,
+                        base,
+                        data_digest=c_snapshot.digest(),
+                        **c_params,
+                    ),
+                )
+                if (c_snapshot is not None and len(c_snapshot) > 0)
+                else pre_ctag
+            )
+            pre_ckpt_path = os.path.join(out_dir, f"{active_ctag}_cases.jsonl")
+            c_prov = {}
+            score_kwargs = {}
+            if _accepts_kwarg(construction_score, "allow_model_stop"):
+                score_kwargs["allow_model_stop"] = allow_model_stop
+            if _accepts_kwarg(construction_score, "checkpoint_path"):
+                score_kwargs["checkpoint_path"] = pre_ckpt_path
+            if _accepts_kwarg(construction_score, "api_key"):
+                score_kwargs["api_key"] = api_key
+            if _accepts_kwarg(construction_score, "api_key_env"):
+                score_kwargs["api_key_env"] = api_key_env
+            if (
+                c_snapshot is not None
+                and len(c_snapshot) > 0
+                and _accepts_explicit_kwarg(construction_score, "price_snapshot")
+            ):
+                score_kwargs["price_snapshot"] = c_snapshot
+            if _accepts_explicit_kwarg(construction_score, "provenance_out"):
+                score_kwargs["provenance_out"] = c_prov
+            rows = construction_score(setups, base, model, **score_kwargs)
+            summ_kwargs = {}
+            if _accepts_kwarg(construction_summ, "min_coverage"):
+                summ_kwargs["min_coverage"] = min_coverage
+            csum = construction_summ(rows, **summ_kwargs)
+
+            # Bind data_digest strictly to the frozen in-memory snapshot actually consumed (OP08)
+            consumed_snap = c_prov.get("price_snapshot")
+            if consumed_snap is not None and len(consumed_snap) > 0:
+                final_c_digest = consumed_snap.digest()
+            elif c_snapshot is not None and len(c_snapshot) > 0:
+                final_c_digest = c_snapshot.digest()
+            else:
+                final_c_digest = _data_digest()
+
+            c_identity = _cache_identity(
+                "construction_alpha",
+                model,
+                base,
+                data_digest=final_c_digest,
+                **c_params,
+            )
+            ctag = _cache_tag("model_alpha", name, c_identity)
+            csum_path = os.path.join(out_dir, f"{ctag}_summary.json")
+            if ctag != active_ctag and os.path.exists(pre_ckpt_path):
+                os.replace(pre_ckpt_path, os.path.join(out_dir, f"{ctag}_cases.jsonl"))
+            _write_json(os.path.join(out_dir, f"{ctag}_rows.json"), rows, indent=2)
+            _save_cached(csum_path, csum, c_identity)
     card["construction_alpha"] = csum
     card["provenance"]["construction_alpha"] = c_identity
 
@@ -310,28 +382,85 @@ def run(
     if bsum is None and not skip_book:
         from book import Book
 
-        pre_trace_path = os.path.join(out_dir, f"{pre_btag}_steps.jsonl")
-        book_kwargs = {}
-        if _accepts_kwarg(Book.__init__, "api_key"):
-            book_kwargs["api_key"] = api_key
-        if _accepts_kwarg(Book.__init__, "api_key_env"):
-            book_kwargs["api_key_env"] = api_key_env
-        if _accepts_kwarg(Book.__init__, "min_coverage"):
-            book_kwargs["min_coverage"] = min_coverage
-        if _accepts_kwarg(Book.__init__, "mark_frequency"):
-            book_kwargs["mark_frequency"] = mark_frequency
-        if _accepts_kwarg(Book.__init__, "trace_path"):
-            book_kwargs["trace_path"] = pre_trace_path
-        b = Book(base, model, start, end, step, **book_kwargs)
-        bsum = b.run()
-        # Recompute provenance digest AFTER cache hydration/updates (OP08)
-        b_identity = _cache_identity("book_backtest", model, base, **b_params)
-        btag = _cache_tag("book", name, b_identity)
-        bsum_path = os.path.join(out_dir, f"{btag}_metrics.json")
-        if btag != pre_btag and os.path.exists(pre_trace_path):
-            os.replace(pre_trace_path, os.path.join(out_dir, f"{btag}_steps.jsonl"))
-        _save_cached(bsum_path, bsum, b_identity)
-        _write_json(os.path.join(out_dir, f"{btag}_equity.json"), b.equity_curve, indent=None)
+        b_snapshot = None
+        if (
+            _accepts_explicit_kwarg(Book.__init__, "price_snapshot")
+            and hasattr(Book, "hydrate_snapshot")
+        ):
+            b_snapshot = Book.hydrate_snapshot(start, end)
+            if b_snapshot is not None and len(b_snapshot) > 0:
+                snap_b_identity = _cache_identity(
+                    "book_backtest",
+                    model,
+                    base,
+                    data_digest=b_snapshot.digest(),
+                    **b_params,
+                )
+                snap_btag = _cache_tag("book", name, snap_b_identity)
+                snap_bsum_path = os.path.join(out_dir, f"{snap_btag}_metrics.json")
+                bsum = _load_cached(snap_bsum_path, snap_b_identity)
+                if bsum is not None:
+                    b_identity = snap_b_identity
+
+        if bsum is None:
+            active_btag = (
+                _cache_tag(
+                    "book",
+                    name,
+                    _cache_identity(
+                        "book_backtest",
+                        model,
+                        base,
+                        data_digest=b_snapshot.digest(),
+                        **b_params,
+                    ),
+                )
+                if (b_snapshot is not None and len(b_snapshot) > 0)
+                else pre_btag
+            )
+            pre_trace_path = os.path.join(out_dir, f"{active_btag}_steps.jsonl")
+            book_kwargs = {}
+            if _accepts_kwarg(Book.__init__, "api_key"):
+                book_kwargs["api_key"] = api_key
+            if _accepts_kwarg(Book.__init__, "api_key_env"):
+                book_kwargs["api_key_env"] = api_key_env
+            if _accepts_kwarg(Book.__init__, "min_coverage"):
+                book_kwargs["min_coverage"] = min_coverage
+            if _accepts_kwarg(Book.__init__, "mark_frequency"):
+                book_kwargs["mark_frequency"] = mark_frequency
+            if _accepts_kwarg(Book.__init__, "trace_path"):
+                book_kwargs["trace_path"] = pre_trace_path
+            if (
+                b_snapshot is not None
+                and len(b_snapshot) > 0
+                and _accepts_explicit_kwarg(Book.__init__, "price_snapshot")
+            ):
+                book_kwargs["price_snapshot"] = b_snapshot
+            b = Book(base, model, start, end, step, **book_kwargs)
+            bsum = b.run()
+
+            # Bind data_digest strictly to the frozen in-memory snapshot actually consumed (OP08)
+            consumed_snap = getattr(b, "price_snapshot", None)
+            if consumed_snap is not None and len(consumed_snap) > 0:
+                final_b_digest = consumed_snap.digest()
+            elif b_snapshot is not None and len(b_snapshot) > 0:
+                final_b_digest = b_snapshot.digest()
+            else:
+                final_b_digest = _data_digest()
+
+            b_identity = _cache_identity(
+                "book_backtest",
+                model,
+                base,
+                data_digest=final_b_digest,
+                **b_params,
+            )
+            btag = _cache_tag("book", name, b_identity)
+            bsum_path = os.path.join(out_dir, f"{btag}_metrics.json")
+            if btag != active_btag and os.path.exists(pre_trace_path):
+                os.replace(pre_trace_path, os.path.join(out_dir, f"{btag}_steps.jsonl"))
+            _save_cached(bsum_path, bsum, b_identity)
+            _write_json(os.path.join(out_dir, f"{btag}_equity.json"), b.equity_curve, indent=None)
     card["book_backtest"] = bsum
     card["provenance"]["book_backtest"] = b_identity
 

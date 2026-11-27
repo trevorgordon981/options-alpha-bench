@@ -13,13 +13,14 @@ The model runs a simulated options book over a date window:
   - equity marks are deduplicated by date (replacing the terminal mark after
     liquidation) and annualized strictly from the configured sampling frequency
 """
+import bisect
 from dataclasses import dataclass
 from datetime import date, timedelta
 import json
 import math
 import os
 
-from data import get_closes
+from data import PriceSnapshot, get_closes, hydrate_price_snapshot, use_price_snapshot
 from llm_client import chat_completion
 from market import slate
 from pricing import bs_price, estimate_iv, strike_for_delta
@@ -200,6 +201,7 @@ class Book:
         mark_frequency="step",
         trace_path=None,
         basket=None,
+        price_snapshot=None,
     ):
         if step_days <= 0:
             raise ValueError(f"step_days must be positive, got {step_days}")
@@ -213,6 +215,7 @@ class Book:
         self.mark_frequency = mark_frequency
         self.trace_path = trace_path
         self.basket = list(BASKET if basket is None else basket)
+        self.price_snapshot = price_snapshot
 
         self.cash = START_EQUITY
         self.positions = []
@@ -220,9 +223,11 @@ class Book:
         self.equity_curve = []          # [(date, equity)]
         self.daily_equity_curve = []    # [(trading_date, equity)]
         self.decision_equity_curve = [] # [(decision_date, equity)]
+        self.sessions = []              # valid trading sessions in [start, end]
+        self.decision_schedule = []     # executed trading-session decision dates
         self.step_log = []
         self.pcount = 0
-        self.px = {}                    # ticker -> {date: close}
+        self.px = price_snapshot.to_dict() if price_snapshot is not None else {}
         self.verbose = verbose
 
         # Distinct outcome counters (OP04, OP09)
@@ -234,6 +239,47 @@ class Book:
         self.parse_fails = 0
         self.schema_fails = 0
         self.invalid_actions = 0
+
+    @property
+    def data_digest(self) -> str | None:
+        return self.price_snapshot.digest() if self.price_snapshot is not None else None
+
+    @classmethod
+    def hydrate_snapshot(
+        cls,
+        start: str,
+        end: str,
+        basket=None,
+        *,
+        lookback_days: int = 100,
+        get_closes_fn=None,
+    ) -> PriceSnapshot:
+        """Hydrate SPY + basket daily closes ONCE into an immutable in-memory PriceSnapshot."""
+        tickers = []
+        seen = set()
+        for tk in ["SPY"] + list(BASKET if basket is None else basket):
+            up = str(tk).upper()
+            if up not in seen:
+                seen.add(up)
+                tickers.append(up)
+        lo = (date.fromisoformat(start) - timedelta(days=lookback_days)).isoformat()
+        hi = end
+        return hydrate_price_snapshot(
+            {tk: (lo, hi) for tk in tickers},
+            get_closes_fn=get_closes_fn or get_closes,
+        )
+
+    def _prepare_snapshot(self, *, lookback_days: int = 100) -> PriceSnapshot:
+        if self.price_snapshot is None:
+            self.price_snapshot = self.hydrate_snapshot(
+                self.start,
+                self.end,
+                basket=self.basket,
+                lookback_days=lookback_days,
+                get_closes_fn=get_closes,
+            )
+        self.px = self.price_snapshot.to_dict()
+        return self.price_snapshot
 
     # ---- model I/O ----
     def _call(self, prompt, max_tokens=1200):
@@ -292,23 +338,39 @@ class Book:
             return (a_iso <= d_iso <= b_iso) if include_start else (a_iso < d_iso <= b_iso)
 
         sessions = set()
-        try:
-            spy = get_closes("SPY", a_iso, b_iso)
-            for d in spy:
+        if self.price_snapshot is not None:
+            for d in self.price_snapshot.get_closes("SPY", a_iso, b_iso):
                 if _in_range(d):
                     sessions.add(d)
-        except Exception:
-            pass
+            for p in self.positions:
+                if p.closed:
+                    continue
+                for d in self.price_snapshot.get_closes(p.ticker, a_iso, b_iso):
+                    if _in_range(d):
+                        sessions.add(d)
+            if not sessions:
+                for tk in self.basket:
+                    for d in self.price_snapshot.get_closes(tk, a_iso, b_iso):
+                        if _in_range(d):
+                            sessions.add(d)
+        else:
+            try:
+                spy = get_closes("SPY", a_iso, b_iso)
+                for d in spy:
+                    if _in_range(d):
+                        sessions.add(d)
+            except Exception:
+                pass
 
-        # Include any trading session dates where an open position has a close bar
-        for p in self.positions:
-            if p.closed:
-                continue
-            if p.ticker not in self.px:
-                _spot_on_or_before(p.ticker, b_iso, self.px, window_start=self.start, window_end=self.end)
-            for d in self.px.get(p.ticker, ()):
-                if _in_range(d):
-                    sessions.add(d)
+            # Include any trading session dates where an open position has a close bar
+            for p in self.positions:
+                if p.closed:
+                    continue
+                if p.ticker not in self.px:
+                    _spot_on_or_before(p.ticker, b_iso, self.px, window_start=self.start, window_end=self.end)
+                for d in self.px.get(p.ticker, ()):
+                    if _in_range(d):
+                        sessions.add(d)
 
         if not sessions:
             for series in self.px.values():
@@ -316,6 +378,32 @@ class Book:
                     if _in_range(d):
                         sessions.add(d)
         return sorted(sessions)
+
+    def _build_decision_schedule(self, sessions: list[str]) -> list[tuple[str, str]]:
+        """Map nominal step_days cadence strictly onto valid trading sessions in [start, end].
+
+        Returns list of (exec_iso, nominal_iso) pairs:
+          - Nominal dates on a valid trading session execute on that session.
+          - Nominal dates on a weekend/holiday defer to the next valid trading session
+            inside [start, end], or are skipped cleanly if no subsequent session exists.
+          - Deduplicated so at most one decision executes on any trading session.
+        """
+        if not sessions:
+            return []
+        schedule = []
+        seen = set()
+        d = date.fromisoformat(self.start)
+        end_d = date.fromisoformat(self.end)
+        while d <= end_d:
+            nominal = d.isoformat()
+            idx = bisect.bisect_left(sessions, nominal)
+            if idx < len(sessions):
+                exec_iso = sessions[idx]
+                if exec_iso not in seen:
+                    seen.add(exec_iso)
+                    schedule.append((exec_iso, nominal))
+            d += timedelta(days=self.step_days)
+        return schedule
 
     def _auto_exits_on_date(self, s_iso):
         """Run -30% stop + 3-DTE time-stop effective on trading session `s_iso` only."""
@@ -373,6 +461,11 @@ class Book:
             self._auto_exits_on_date(s_iso)
 
     def _close(self, p, iso, val_ps, reason):
+        if iso < p.entry_date:
+            raise ValueError(
+                f"Invalid trade chronology for {p.pid} ({p.ticker}): "
+                f"exit_date {iso!r} precedes entry_date {p.entry_date!r}"
+            )
         p.closed = True
         p.exit_date, p.exit_val_ps, p.exit_reason = iso, val_ps, reason
         self.cash += val_ps * 100 * p.contracts
@@ -395,6 +488,9 @@ class Book:
         Returns None when all requested actions are semantically valid, or an explicit
         error message when any requested action is impossible/unusable (OP09).
         """
+        if not _is_weekday(iso):
+            return f"decision date {iso!r} is not a valid trading weekday"
+
         open_by_pid = {p.pid: p for p in self.positions if not p.closed}
         seen_close = set()
         for idx, pid in enumerate(dec["close"]):
@@ -425,6 +521,8 @@ class Book:
         return None
 
     def _open(self, iso, spec, equity):
+        if not _is_weekday(iso):
+            return None
         valid_spec, err = validate_book_open_spec(spec)
         if err is not None:
             return None
@@ -438,9 +536,13 @@ class Book:
         dte = valid_spec["entry_dte"]
         delta = valid_spec["long_delta"]
         size_pct = valid_spec["size_pct"]
-        # IV from that ticker's realized vol at entry
+        # IV from that ticker's realized vol at entry (strictly from frozen snapshot if active)
         d0 = date.fromisoformat(iso)
-        hist = get_closes(tk, (d0 - timedelta(days=45)).isoformat(), iso)
+        hist_lo = (d0 - timedelta(days=45)).isoformat()
+        if self.price_snapshot is not None:
+            hist = self.price_snapshot.get_closes(tk, hist_lo, iso)
+        else:
+            hist = get_closes(tk, hist_lo, iso)
         iv = estimate_iv([v for _, v in sorted(hist.items())], 20)
         t0 = dte / 365.0
         k = "call" if "call" in direction else "put"
@@ -471,13 +573,15 @@ class Book:
         opens = [p for p in self.positions if not p.closed]
         lines = []
         for p in opens:
-            spot = _spot_on_or_before(p.ticker, iso, self.px)
+            spot = _spot_on_or_before(
+                p.ticker, iso, self.px, window_start=self.start, window_end=self.end
+            )
             val = p.value_ps(spot, date.fromisoformat(iso).toordinal())
             pnl = (val - p.entry_cost_ps) / p.entry_cost_ps * 100 if p.entry_cost_ps else 0
             dte = p.expiry_ord - date.fromisoformat(iso).toordinal()
             lines.append(f'  {p.pid}: {p.ticker} {p.direction} x{p.contracts}, {dte} DTE, P&L {pnl:+.0f}%')
         pos_block = "\n".join(lines) if lines else "  (none)"
-        sl = slate(self.basket, iso, top=8)
+        sl = slate(self.basket, iso, top=8, price_snapshot=self.price_snapshot)
         slate_block = "\n".join(
             f'  {c["ticker"]}: ${c["spot"]}, 5d {c["ret_5d"]*100:+.0f}%, 20d {c["ret_20d"]*100:+.0f}%, '
             f'{c["pct_below_high"]*100:.0f}% below high, rvol {c["rvol"]:.0%}' for c in sl)
@@ -502,153 +606,168 @@ Open [] to sit in cash. Never exceed {MAX_CONCURRENT} open positions."""
 
     # ---- run ----
     def run(self):
-        d = date.fromisoformat(self.start)
+        snapshot = self._prepare_snapshot()
         end_d = date.fromisoformat(self.end)
-        last_advanced_iso = None
-        while d <= end_d:
-            iso = d.isoformat()
-            if last_advanced_iso is None:
-                self._advance_sessions(self.start, iso, include_start=True)
-            else:
-                self._advance_sessions(last_advanced_iso, iso, include_start=False)
-            last_advanced_iso = iso
+        fin = end_d.isoformat()
 
-            equity = self._mark_equity(iso)
-            self._record_equity(iso, equity, self.decision_equity_curve)
-            if self.mark_frequency == "step":
-                self._record_equity(iso, equity, self.equity_curve)
+        with use_price_snapshot(snapshot):
+            sessions = self._trading_sessions_between(self.start, fin, include_start=True)
+            schedule = self._build_decision_schedule(sessions)
+            self.sessions = list(sessions)
+            self.decision_schedule = [exec_iso for exec_iso, _ in schedule]
 
-            self.decision_steps_run += 1
-            step_record = {
-                "step": self.decision_steps_run,
-                "date": iso,
-                "equity_before": round(equity, 2),
-                "cash_before": round(self.cash, 2),
-            }
+            last_advanced_iso = None
+            for iso, nominal_iso in schedule:
+                exec_ord = date.fromisoformat(iso).toordinal()
+                if last_advanced_iso is None:
+                    self._advance_sessions(self.start, iso, include_start=True)
+                else:
+                    self._advance_sessions(last_advanced_iso, iso, include_start=False)
+                last_advanced_iso = iso
 
-            prompt_text = self._prompt(iso, equity)
-            try:
-                out = self._call(prompt_text)
-            except Exception as e:
-                self.transport_errors += 1
-                step_record["status"] = "transport_error"
-                step_record["error"] = str(e)
-                self._record_step(step_record)
-                if self.verbose:
-                    print(f"  {iso} call err: {e}", flush=True)
-            else:
-                dec, err_kind, err_detail = self._parse_and_validate(out)
-                if dec is None:
-                    if err_kind == "schema_fail":
-                        self.schema_fails += 1
-                    else:
-                        self.parse_fails += 1
-                    step_record["status"] = err_kind
-                    step_record["error"] = err_detail
+                equity = self._mark_equity(iso)
+                self._record_equity(iso, equity, self.decision_equity_curve)
+                if self.mark_frequency == "step":
+                    self._record_equity(iso, equity, self.equity_curve)
+
+                self.decision_steps_run += 1
+                step_record = {
+                    "step": self.decision_steps_run,
+                    "date": iso,
+                    "equity_before": round(equity, 2),
+                    "cash_before": round(self.cash, 2),
+                }
+                if nominal_iso != iso:
+                    step_record["nominal_date"] = nominal_iso
+
+                prompt_text = self._prompt(iso, equity)
+                try:
+                    out = self._call(prompt_text)
+                except Exception as e:
+                    self.transport_errors += 1
+                    step_record["status"] = "transport_error"
+                    step_record["error"] = str(e)
                     self._record_step(step_record)
                     if self.verbose:
-                        print(f"  {iso} {err_kind}: {err_detail}", flush=True)
+                        print(f"  {iso} call err: {e}", flush=True)
                 else:
-                    action_err = self._validate_step_actions(dec, iso)
-                    if action_err is not None:
-                        self.invalid_actions += 1
-                        step_record["status"] = "invalid_action"
-                        step_record["error"] = action_err
-                        step_record["closed"] = []
-                        step_record["opened"] = []
+                    dec, err_kind, err_detail = self._parse_and_validate(out)
+                    if dec is None:
+                        if err_kind == "schema_fail":
+                            self.schema_fails += 1
+                        else:
+                            self.parse_fails += 1
+                        step_record["status"] = err_kind
+                        step_record["error"] = err_detail
                         self._record_step(step_record)
                         if self.verbose:
-                            print(f"  {iso} invalid_action: {action_err}", flush=True)
-                    elif (not dec["close"]) and (not dec["open"]):
-                        self.valid_decisions += 1
-                        self.deliberate_abstentions += 1
-                        step_record["status"] = "abstain"
-                        step_record["closed"] = []
-                        step_record["opened"] = []
-                        self._record_step(step_record)
+                            print(f"  {iso} {err_kind}: {err_detail}", flush=True)
                     else:
-                        closed_pids = []
-                        for pid in dec["close"]:
-                            for p in self.positions:
-                                if p.pid == pid and not p.closed:
-                                    spot = _spot_on_or_before(
-                                        p.ticker, iso, self.px,
-                                        window_start=self.start, window_end=self.end,
-                                    )
-                                    if spot is not None:
-                                        self._close(p, iso, p.value_ps(spot, d.toordinal()), "model_close")
-                                        closed_pids.append(pid)
-
-                        opened_pids = []
-                        nopen = len([p for p in self.positions if not p.closed])
-                        for spec in dec["open"]:
-                            if nopen >= MAX_CONCURRENT:
-                                break
-                            opened = self._open(iso, spec, equity)
-                            if opened:
-                                opened_pids.append(opened.pid)
-                                nopen += 1
-
-                        if not closed_pids and not opened_pids:
+                        action_err = self._validate_step_actions(dec, iso)
+                        if action_err is not None:
                             self.invalid_actions += 1
                             step_record["status"] = "invalid_action"
-                            step_record["error"] = "no requested action could be executed against current cash/pricing"
+                            step_record["error"] = action_err
                             step_record["closed"] = []
                             step_record["opened"] = []
                             self._record_step(step_record)
                             if self.verbose:
-                                print(f"  {iso} invalid_action: {step_record['error']}", flush=True)
-                        else:
+                                print(f"  {iso} invalid_action: {action_err}", flush=True)
+                        elif (not dec["close"]) and (not dec["open"]):
                             self.valid_decisions += 1
-                            step_record["status"] = "ok"
-                            step_record["closed"] = closed_pids
-                            step_record["opened"] = opened_pids
+                            self.deliberate_abstentions += 1
+                            step_record["status"] = "abstain"
+                            step_record["closed"] = []
+                            step_record["opened"] = []
                             self._record_step(step_record)
+                        else:
+                            closed_pids = []
+                            for pid in dec["close"]:
+                                for p in self.positions:
+                                    if p.pid == pid and not p.closed:
+                                        spot = _spot_on_or_before(
+                                            p.ticker, iso, self.px,
+                                            window_start=self.start, window_end=self.end,
+                                        )
+                                        if spot is not None:
+                                            self._close(p, iso, p.value_ps(spot, exec_ord), "model_close")
+                                            closed_pids.append(pid)
 
-            if self.verbose:
-                print(
-                    f"  {iso}  eq=${equity:,.0f}  open={len([p for p in self.positions if not p.closed])} "
-                    f"closed={len(self.closed)}",
-                    flush=True,
-                )
-            d += timedelta(days=self.step_days)
+                            opened_pids = []
+                            nopen = len([p for p in self.positions if not p.closed])
+                            for spec in dec["open"]:
+                                if nopen >= MAX_CONCURRENT:
+                                    break
+                                opened = self._open(iso, spec, equity)
+                                if opened:
+                                    opened_pids.append(opened.pid)
+                                    nopen += 1
 
-        # Advance remaining trading sessions chronologically through end date
-        fin = end_d.isoformat()
-        if last_advanced_iso is None:
-            self._advance_sessions(self.start, fin, include_start=True)
-        else:
-            self._advance_sessions(last_advanced_iso, fin, include_start=False)
+                            if not closed_pids and not opened_pids:
+                                self.invalid_actions += 1
+                                step_record["status"] = "invalid_action"
+                                step_record["error"] = "no requested action could be executed against current cash/pricing"
+                                step_record["closed"] = []
+                                step_record["opened"] = []
+                                self._record_step(step_record)
+                                if self.verbose:
+                                    print(f"  {iso} invalid_action: {step_record['error']}", flush=True)
+                            else:
+                                self.valid_decisions += 1
+                                step_record["status"] = "ok"
+                                step_record["closed"] = closed_pids
+                                step_record["opened"] = opened_pids
+                                self._record_step(step_record)
 
-        # In daily mode, liquidate on the final trading session rather than inserting a weekend mark
-        if (
-            self.mark_frequency == "daily"
-            and self.daily_equity_curve
-            and fin != self.daily_equity_curve[-1][0]
-        ):
-            liq_iso = self.daily_equity_curve[-1][0]
-        else:
-            liq_iso = fin
-        liq_ord = date.fromisoformat(liq_iso).toordinal()
+                if self.verbose:
+                    print(
+                        f"  {iso}  eq=${equity:,.0f}  open={len([p for p in self.positions if not p.closed])} "
+                        f"closed={len(self.closed)}",
+                        flush=True,
+                    )
 
-        # Liquidate remaining open positions at final marks and REPLACE terminal mark
-        for p in self.positions:
-            if not p.closed:
+            # Advance remaining trading sessions chronologically through end date
+            if last_advanced_iso is None:
+                self._advance_sessions(self.start, fin, include_start=True)
+            else:
+                self._advance_sessions(last_advanced_iso, fin, include_start=False)
+
+            # Liquidate remaining open positions strictly on the final valid trading session (OP11)
+            if sessions:
+                liq_iso = sessions[-1]
+            elif self.daily_equity_curve:
+                liq_iso = self.daily_equity_curve[-1][0]
+            else:
+                liq_iso = fin
+
+            open_positions = [p for p in self.positions if not p.closed]
+            if open_positions:
+                latest_entry = max(p.entry_date for p in open_positions)
+                if liq_iso < latest_entry:
+                    raise ValueError(
+                        f"Final liquidation date {liq_iso!r} precedes latest open position "
+                        f"entry_date {latest_entry!r}"
+                    )
+            liq_ord = date.fromisoformat(liq_iso).toordinal()
+
+            for p in open_positions:
                 spot = _spot_on_or_before(
                     p.ticker, liq_iso, self.px, window_start=self.start, window_end=self.end
                 )
                 if spot is not None:
                     self._close(p, liq_iso, p.value_ps(spot, liq_ord), "final_liquidation")
-        final_eq = self.cash
-        if self.mark_frequency == "step":
-            self._record_equity(fin, final_eq, self.equity_curve)
-            if self.daily_equity_curve and self.daily_equity_curve[-1][0] == fin:
-                self._record_equity(fin, final_eq, self.daily_equity_curve)
-        else:
-            if self.daily_equity_curve or _is_weekday(liq_iso):
-                self._record_equity(liq_iso, final_eq, self.daily_equity_curve)
-                self._record_equity(liq_iso, final_eq, self.equity_curve)
-        return self.metrics()
+
+            final_eq = self.cash
+            if sessions or self.daily_equity_curve or _is_weekday(liq_iso):
+                if self.mark_frequency == "step":
+                    self._record_equity(liq_iso, final_eq, self.equity_curve)
+                    if self.daily_equity_curve and self.daily_equity_curve[-1][0] == liq_iso:
+                        self._record_equity(liq_iso, final_eq, self.daily_equity_curve)
+                else:
+                    self._record_equity(liq_iso, final_eq, self.daily_equity_curve)
+                    self._record_equity(liq_iso, final_eq, self.equity_curve)
+
+            return self.metrics()
 
     def metrics(self):
         stats = compute_equity_metrics(
@@ -664,8 +783,11 @@ Open [] to sit in cash. Never exceed {MAX_CONCURRENT} open positions."""
         yrs = duration_days / 365.25
         wins = [p for p in self.closed if p.exit_val_ps > p.entry_cost_ps]
 
-        # Comparators: uninvested cash (0%) and SPY buy-and-hold
-        spy = get_closes("SPY", self.start, self.end)
+        # Comparators: uninvested cash (0%) and SPY buy-and-hold (strictly from frozen snapshot if set)
+        if self.price_snapshot is not None:
+            spy = self.price_snapshot.get_closes("SPY", self.start, self.end)
+        else:
+            spy = get_closes("SPY", self.start, self.end)
         spy_items = sorted(spy.items())
         spy_ret = (spy_items[-1][1] / spy_items[0][1] - 1.0) if len(spy_items) > 1 else 0.0
         spy_cagr = (1.0 + spy_ret) ** (1.0 / yrs) - 1.0 if yrs > 0 else 0.0
@@ -735,6 +857,7 @@ Open [] to sit in cash. Never exceed {MAX_CONCURRENT} open positions."""
                 r: sum(1 for p in self.closed if p.exit_reason == r)
                 for r in sorted(set(p.exit_reason for p in self.closed))
             },
+            "data_digest": self.data_digest,
         }
 
 

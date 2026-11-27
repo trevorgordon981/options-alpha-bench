@@ -8,10 +8,12 @@ We validate the typed schema strictly, walk the trade forward on daily closes
 time-stop rules (unless model-controlled stop variation is explicitly enabled).
 """
 import argparse
+from datetime import date, timedelta
 import json
 import os
 import statistics as st
 
+from data import PriceSnapshot, hydrate_price_snapshot, path_from, use_price_snapshot
 from engine import Trade, simulate
 from llm_client import chat_completion
 from scenarios import generate
@@ -78,6 +80,23 @@ def parse_trade(text):
     return valid
 
 
+def hydrate_snapshot_for_setups(setups, *, get_closes_fn=None) -> PriceSnapshot:
+    """Hydrate all price series needed for `setups` ONCE into an immutable PriceSnapshot."""
+    windows: dict[str, tuple[str, str]] = {}
+    for s in setups:
+        tk = str(s["ticker"]).upper()
+        d0 = date.fromisoformat(s["entry_date"])
+        hz = int(s.get("horizon_days", 21))
+        lo = (d0 - timedelta(days=45)).isoformat()
+        hi = (d0 + timedelta(days=hz + 30)).isoformat()
+        if tk in windows:
+            prev_lo, prev_hi = windows[tk]
+            windows[tk] = (min(prev_lo, lo), max(prev_hi, hi))
+        else:
+            windows[tk] = (lo, hi)
+    return hydrate_price_snapshot(windows, get_closes_fn=get_closes_fn)
+
+
 def score(
     setups,
     base,
@@ -89,131 +108,152 @@ def score(
     api_key=None,
     api_key_env=None,
     verbose=True,
+    price_snapshot=None,
+    provenance_out=None,
 ):
-    """Score setups one-by-one, persisting terminal outcomes without aborting on bad replies."""
-    from data import path_from
-
+    """Score setups one-by-one against a single frozen in-memory price snapshot."""
     rows = []
     stop_policy = "model_controlled" if allow_model_stop else "fixed"
     selected = setups if limit is None else setups[:limit]
+    snapshot = (
+        price_snapshot
+        if price_snapshot is not None
+        else hydrate_snapshot_for_setups(selected)
+    )
+    if provenance_out is not None:
+        provenance_out["price_snapshot"] = snapshot
+        provenance_out["data_digest"] = snapshot.digest()
+        provenance_out["tickers"] = list(snapshot.tickers())
 
     def _emit(row):
         rows.append(row)
         if checkpoint_path:
             append_jsonl_record(checkpoint_path, row)
 
-    for i, s in enumerate(selected):
-        case_id = f"{s['ticker']}:{s['entry_date']}:{s['horizon_days']}"
-        try:
-            _, fwd = path_from(s["ticker"], s["entry_date"], days_forward=s["horizon_days"] + 10)
-            if not fwd:
-                raise ValueError("empty forward path")
-            spot = fwd[0][1]
-        except Exception as e:
-            _emit({
-                "case_id": case_id,
-                "ticker": s["ticker"],
-                "entry": s["entry_date"],
-                "status": "data_error",
-                "err": f"data:{e}",
-            })
-            continue
+    with use_price_snapshot(snapshot):
+        for i, s in enumerate(selected):
+            case_id = f"{s['ticker']}:{s['entry_date']}:{s['horizon_days']}"
+            case_digest = snapshot.subset([s["ticker"]]).digest()
+            try:
+                _, fwd = path_from(
+                    s["ticker"],
+                    s["entry_date"],
+                    days_forward=s["horizon_days"] + 10,
+                    price_snapshot=snapshot,
+                )
+                if not fwd:
+                    raise ValueError("empty forward path")
+                spot = fwd[0][1]
+            except Exception as e:
+                _emit({
+                    "case_id": case_id,
+                    "ticker": s["ticker"],
+                    "entry": s["entry_date"],
+                    "status": "data_error",
+                    "err": f"data:{e}",
+                    "data_digest": case_digest,
+                })
+                continue
 
-        prompt = PROMPT.format(ticker=s["ticker"], spot=spot, mom=s["mom20"], hz=s["horizon_days"])
-        try:
-            out = call_model(prompt, base, model, api_key=api_key, api_key_env=api_key_env)
-        except Exception as e:
-            _emit({
-                "case_id": case_id,
-                "ticker": s["ticker"],
-                "entry": s["entry_date"],
-                "status": "call_error",
-                "err": f"call:{e}",
-            })
-            continue
+            prompt = PROMPT.format(ticker=s["ticker"], spot=spot, mom=s["mom20"], hz=s["horizon_days"])
+            try:
+                out = call_model(prompt, base, model, api_key=api_key, api_key_env=api_key_env)
+            except Exception as e:
+                _emit({
+                    "case_id": case_id,
+                    "ticker": s["ticker"],
+                    "entry": s["entry_date"],
+                    "status": "call_error",
+                    "err": f"call:{e}",
+                    "data_digest": case_digest,
+                })
+                continue
 
-        j, err_status, err_detail = parse_and_validate_trade(out)
-        if j is None:
-            _emit({
-                "case_id": case_id,
-                "ticker": s["ticker"],
-                "entry": s["entry_date"],
-                "status": err_status,
-                "err": f"{err_status}:{err_detail}",
-                "raw": out[-200:] if isinstance(out, str) else repr(out)[:200],
-            })
-            continue
+            j, err_status, err_detail = parse_and_validate_trade(out)
+            if j is None:
+                _emit({
+                    "case_id": case_id,
+                    "ticker": s["ticker"],
+                    "entry": s["entry_date"],
+                    "status": err_status,
+                    "err": f"{err_status}:{err_detail}",
+                    "raw": out[-200:] if isinstance(out, str) else repr(out)[:200],
+                    "data_digest": case_digest,
+                })
+                continue
 
-        requested_stop = j["stop_pct"]
-        applied_stop = requested_stop if allow_model_stop else FIXED_PREMIUM_STOP
-        stop_override_applied = (not allow_model_stop) and (abs(requested_stop - FIXED_PREMIUM_STOP) > 1e-9)
-        policy_confounded = allow_model_stop and (abs(requested_stop - FIXED_PREMIUM_STOP) > 1e-9)
+            requested_stop = j["stop_pct"]
+            applied_stop = requested_stop if allow_model_stop else FIXED_PREMIUM_STOP
+            stop_override_applied = (not allow_model_stop) and (abs(requested_stop - FIXED_PREMIUM_STOP) > 1e-9)
+            policy_confounded = allow_model_stop and (abs(requested_stop - FIXED_PREMIUM_STOP) > 1e-9)
 
-        # Model trade: under default fixed policy, stop & time-stop match baseline identically.
-        mt = Trade(
-            s["ticker"],
-            s["entry_date"],
-            j["direction"],
-            j["entry_dte"],
-            horizon_days=s["horizon_days"],
-            long_delta=j["long_delta"],
-            premium_stop=applied_stop,
-            time_stop_dte=FIXED_TIME_STOP_DTE,
-        )
-        mr = simulate(mt)
-
-        # Paired 35-DTE baseline with identical direction, delta, and common fixed stop policy.
-        dt = Trade(
-            s["ticker"],
-            s["entry_date"],
-            j["direction"],
-            35,
-            horizon_days=s["horizon_days"],
-            long_delta=j["long_delta"],
-            premium_stop=FIXED_PREMIUM_STOP,
-            time_stop_dte=FIXED_TIME_STOP_DTE,
-        )
-        dr = simulate(dt)
-
-        if not mr.ok:
-            _emit({
-                "case_id": case_id,
-                "ticker": s["ticker"],
-                "entry": s["entry_date"],
-                "status": "sim_error",
-                "err": mr.err,
-                "model_dte": j["entry_dte"],
-            })
-            continue
-
-        row = {
-            "case_id": case_id,
-            "ticker": s["ticker"],
-            "entry": s["entry_date"],
-            "status": "ok",
-            "dir": j["direction"],
-            "model_dte": j["entry_dte"],
-            "long_delta": j["long_delta"],
-            "conviction": j["conviction"],
-            "stop_policy": stop_policy,
-            "requested_stop_pct": requested_stop,
-            "applied_stop_pct": applied_stop,
-            "baseline_stop_pct": FIXED_PREMIUM_STOP,
-            "stop_override_applied": stop_override_applied,
-            "policy_confounded": policy_confounded,
-            "model_ret": round(mr.return_pct, 4),
-            "model_reason": mr.exit_reason,
-            "doctrine_ret": round(dr.return_pct, 4) if dr.ok else None,
-            "underlying_ret": round(mr.underlying_return_pct, 4),
-        }
-        _emit(row)
-        if verbose:
-            print(
-                f"[{i+1}] {s['ticker']:5} {s['entry_date']} {j['direction']:16} "
-                f"dte={j['entry_dte']:>4} stop={applied_stop:.2f} -> "
-                f"ret={mr.return_pct*100:+6.1f}% ({mr.exit_reason})",
-                flush=True,
+            # Model trade: under default fixed policy, stop & time-stop match baseline identically.
+            mt = Trade(
+                s["ticker"],
+                s["entry_date"],
+                j["direction"],
+                j["entry_dte"],
+                horizon_days=s["horizon_days"],
+                long_delta=j["long_delta"],
+                premium_stop=applied_stop,
+                time_stop_dte=FIXED_TIME_STOP_DTE,
             )
+            mr = simulate(mt)
+
+            # Paired 35-DTE baseline with identical direction, delta, and common fixed stop policy.
+            dt = Trade(
+                s["ticker"],
+                s["entry_date"],
+                j["direction"],
+                35,
+                horizon_days=s["horizon_days"],
+                long_delta=j["long_delta"],
+                premium_stop=FIXED_PREMIUM_STOP,
+                time_stop_dte=FIXED_TIME_STOP_DTE,
+            )
+            dr = simulate(dt)
+
+            if not mr.ok:
+                _emit({
+                    "case_id": case_id,
+                    "ticker": s["ticker"],
+                    "entry": s["entry_date"],
+                    "status": "sim_error",
+                    "err": mr.err,
+                    "model_dte": j["entry_dte"],
+                    "data_digest": case_digest,
+                })
+                continue
+
+            row = {
+                "case_id": case_id,
+                "ticker": s["ticker"],
+                "entry": s["entry_date"],
+                "status": "ok",
+                "data_digest": case_digest,
+                "dir": j["direction"],
+                "model_dte": j["entry_dte"],
+                "long_delta": j["long_delta"],
+                "conviction": j["conviction"],
+                "stop_policy": stop_policy,
+                "requested_stop_pct": requested_stop,
+                "applied_stop_pct": applied_stop,
+                "baseline_stop_pct": FIXED_PREMIUM_STOP,
+                "stop_override_applied": stop_override_applied,
+                "policy_confounded": policy_confounded,
+                "model_ret": round(mr.return_pct, 4),
+                "model_reason": mr.exit_reason,
+                "doctrine_ret": round(dr.return_pct, 4) if dr.ok else None,
+                "underlying_ret": round(mr.underlying_return_pct, 4),
+            }
+            _emit(row)
+            if verbose:
+                print(
+                    f"[{i+1}] {s['ticker']:5} {s['entry_date']} {j['direction']:16} "
+                    f"dte={j['entry_dte']:>4} stop={applied_stop:.2f} -> "
+                    f"ret={mr.return_pct*100:+6.1f}% ({mr.exit_reason})",
+                    flush=True,
+                )
     return rows
 
 
@@ -308,6 +348,7 @@ if __name__ == "__main__":
     a = ap.parse_args()
     setups = generate()
     print(f"{len(setups)} setups; scoring {a.limit or len(setups)} via {a.model}", flush=True)
+    prov = {}
     rows = score(
         setups,
         a.base,
@@ -315,8 +356,11 @@ if __name__ == "__main__":
         a.limit,
         allow_model_stop=a.allow_model_stop,
         checkpoint_path=f"{a.out}_cases.jsonl",
+        provenance_out=prov,
     )
     summ = summarize(rows, min_coverage=a.min_coverage)
+    if "data_digest" in prov:
+        summ["data_digest"] = prov["data_digest"]
     with open(f"{a.out}_rows.json", "w") as f:
         json.dump(rows, f, indent=2)
     with open(f"{a.out}_summary.json", "w") as f:
