@@ -36,7 +36,14 @@ def context(ticker, asof, lookback_days=90):
 
 def slate(basket, asof, top=8):
     """Candidate slate at `asof`: contexts sorted by |20d momentum| (most actionable first)."""
-    ctx = [c for c in (context(t, asof) for t in basket) if c]
+    ctx = []
+    for t in basket:
+        try:
+            c = context(t, asof)
+        except Exception:
+            c = None
+        if c:
+            ctx.append(c)
     ctx.sort(key=lambda c: abs(c["ret_20d"]), reverse=True)
     return ctx[:top]
 

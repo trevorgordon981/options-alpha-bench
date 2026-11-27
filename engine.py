@@ -1,17 +1,17 @@
 """
-Forward-walk P&L engine. Takes a structured Trade + a real underlying path and
-returns realized P&L, walking day-by-day and honoring Trevor's exit discipline:
-  - fixed -30% premium stop (his airtight stop)
+Forward-walk P&L engine. Takes a structured Trade + an underlying close path and
+returns simulated P&L, walking day-by-day and honoring fixed exit discipline:
+  - fixed -30% premium stop (evaluated on daily closes; overnight gaps can fill worse)
   - 3-DTE time-stop
   - thesis-horizon exit
   - optional profit target
-Options are repriced each day via Black-Scholes on the REAL close (see pricing.py).
+Options are repriced each day via Black-Scholes on the daily close (see pricing.py).
 """
 from dataclasses import dataclass, field
 from datetime import date
 
 from data import path_from
-from pricing import bs_price, estimate_iv, strike_for_delta
+from pricing import bs_delta, bs_gamma, bs_price, bs_theta, estimate_iv, strike_for_delta
 
 
 @dataclass
@@ -45,6 +45,9 @@ class Result:
     underlying_return_pct: float = 0.0
     err: str = ""
     legs: dict = field(default_factory=dict)
+    entry_delta: float = 0.0
+    entry_gamma: float = 0.0
+    entry_theta_per_day: float = 0.0
 
 
 def _kind(direction):
@@ -56,6 +59,18 @@ def _value(direction, spot, legs, t, iv):
     if "spread" in direction:
         return bs_price(spot, legs["long_k"], t, iv, k) - bs_price(spot, legs["short_k"], t, iv, k)
     return bs_price(spot, legs["long_k"], t, iv, k)
+
+
+def _entry_greeks(direction, spot, legs, t, iv):
+    k = _kind(direction)
+    delta = bs_delta(spot, legs["long_k"], t, iv, k)
+    gamma = bs_gamma(spot, legs["long_k"], t, iv)
+    theta = bs_theta(spot, legs["long_k"], t, iv, k)
+    if "spread" in direction:
+        delta -= bs_delta(spot, legs["short_k"], t, iv, k)
+        gamma -= bs_gamma(spot, legs["short_k"], t, iv)
+        theta -= bs_theta(spot, legs["short_k"], t, iv, k)
+    return delta, gamma, theta
 
 
 def simulate(trade: Trade) -> Result:
@@ -79,6 +94,9 @@ def simulate(trade: Trade) -> Result:
     entry_cost = _value(trade.direction, entry_spot, legs, t0, iv)
     if entry_cost <= 0.01:
         return Result(trade, False, err="degenerate entry cost", entry_spot=entry_spot)
+    entry_delta, entry_gamma, entry_theta = _entry_greeks(
+        trade.direction, entry_spot, legs, t0, iv
+    )
 
     expiry = date.fromisoformat(entry_iso).toordinal() + trade.entry_dte
     horizon_end = date.fromisoformat(entry_iso).toordinal() + trade.horizon_days
@@ -110,14 +128,16 @@ def simulate(trade: Trade) -> Result:
         hold_trading_days=held, exit_dte=exit_dte, exit_reason=exit_reason,
         underlying_return_pct=(exit_spot - entry_spot) / entry_spot,
         legs={kk: round(vv, 2) for kk, vv in legs.items()},
+        entry_delta=round(entry_delta, 4),
+        entry_gamma=round(entry_gamma, 6),
+        entry_theta_per_day=round(entry_theta, 4),
     )
 
 
 if __name__ == "__main__":
-    # One trade both ways: NVDA bullish June 2024, 3-week thesis.
-    for dte, tag in [(35, "doctrine 35-DTE"), (168, "8x rule ~168-DTE")]:
+    for dte, tag in [(35, "35-DTE leg"), (168, "8x horizon ~168-DTE leg")]:
         t = Trade("NVDA", "2024-06-10", "long_call", dte, horizon_days=21, long_delta=0.60)
         r = simulate(t)
-        print(f"{tag:20} cost={r.entry_cost:6.2f}  exit={r.exit_val:6.2f}  "
+        print(f"{tag:24} K={r.legs.get('long_k')} cost={r.entry_cost:6.2f}  exit={r.exit_val:6.2f}  "
               f"ret={r.return_pct*100:+6.1f}%  reason={r.exit_reason:9} "
               f"held={r.hold_trading_days}d  underlying={r.underlying_return_pct*100:+.1f}%")

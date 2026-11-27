@@ -21,5 +21,7 @@ jobs:
           python-version: "3.12"
       - name: Syntax check
         run: python -m compileall -q .
-      - name: Run unit tests
-        run: python -m unittest discover -s tests -v
+      - name: Run full unit test suite
+        run: python -m unittest discover -s tests -p "test_*.py" -v
+      - name: Verify reproducible offline demo
+        run: python bench.py demo

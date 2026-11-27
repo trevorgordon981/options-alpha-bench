@@ -1,8 +1,8 @@
 """
 Disciplined RULES-EXPERT policy for the autonomous options book (book.py).
 
-This is the "expert teacher" whose (book-state -> decision) trace we distill into
-training rows for Alfred. It implements Trevor's stated doctrine EXACTLY:
+This is a deterministic rules-based baseline policy for the options book simulator
+(book.py). It implements a fixed defined-risk doctrine:
 
   - Conviction-scaled sizing (base target by conviction 10/8->15%, 5->10%, 4->8%,
     3->6% of net-liq). NEVER a blanket per-trade cap.

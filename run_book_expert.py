@@ -1,10 +1,9 @@
 """
 Driver: run the disciplined RULES-EXPERT (expert_policy.expert_decision) through the
-REAL book.py engine over the full window, capturing metrics + a full per-step trace
-(state handed in -> expert decision + reasoning). Nothing about accounting, pricing,
-stops, or equity is reimplemented -- we reuse Book._auto_exits / _mark_equity / _open
-/ _close / metrics exactly (same pattern as book_opus_driver.py), replacing only the
-model-I/O step with the python expert.
+book.py engine over the full window, capturing metrics + a full per-step trace
+(state handed in -> expert decision + reasoning). Reuses Book._auto_exits /
+_mark_equity / _open / _close / metrics directly, replacing only model I/O with the
+deterministic Python rules policy.
 
 Outputs:
   book_expert_metrics.json   -- CAGR/Sharpe/DD/hit-rate/alpha vs SPY
@@ -24,21 +23,18 @@ from data import get_closes
 START, END, STEP = "2024-02-01", "2026-04-15", 7
 
 # SPY trend filter window (trading days) for the confirmed-risk-off cash gate.
-# Defensible, general trend rule (SPY below its N-day SMA = risk-off), NOT tuned to
-# specific 2024-2026 crash dates. Env-tunable for iteration; default 100d (~5-month
-# trend, a classic medium-term timing filter).
 SPY_MA_DAYS = int(os.environ.get("EX_SPY_MA_DAYS", 100))
 
 
 def spy_trend(iso):
     """SPY vs its N-day simple moving average as of `iso` (inclusive, no lookahead).
-    Returns (spot, sma, below_ma_bool, gap_frac). All from real cached closes."""
+    Returns (spot, sma, below_ma_bool, gap_frac). All from cached closes."""
     d0 = date.fromisoformat(iso)
     start = (d0 - timedelta(days=int(SPY_MA_DAYS * 1.7) + 40)).isoformat()
     closes = get_closes("SPY", start, iso)
     px = [v for k, v in sorted(closes.items()) if k <= iso]
     if len(px) < SPY_MA_DAYS:
-        return (px[-1] if px else 0.0, None, False, 0.0)  # too early -> no gate
+        return (px[-1] if px else 0.0, None, False, 0.0)
     spot = px[-1]
     sma = sum(px[-SPY_MA_DAYS:]) / SPY_MA_DAYS
     gap = (spot - sma) / sma if sma else 0.0
@@ -95,12 +91,18 @@ def main():
     while d <= end_d:
         iso = d.isoformat()
         b._auto_exits(prev_iso, iso)
+        b._mark_daily_between(prev_iso, iso)
         equity = b._mark_equity(iso)
-        b.equity_curve.append((iso, round(equity, 2)))
+        b._record_equity(iso, equity, b.equity_curve)
+        b._record_equity(iso, equity, b.daily_equity_curve)
         peak_equity = max(peak_equity, equity)
 
         state = build_state(b, iso, equity, peak_equity)
         decision, reasoning = expert_decision(state)
+        b.decision_steps_run += 1
+        b.valid_decisions += 1
+        if not decision.get("close") and not decision.get("open"):
+            b.deliberate_abstentions += 1
 
         # ---- apply closes ----
         closed_report = []
@@ -138,14 +140,16 @@ def main():
         prev_iso = iso
         d += timedelta(days=STEP)
 
-    # ---- final liquidation (same as Book.run) ----
+    # ---- final liquidation (replace terminal mark cleanly) ----
     fin = end_d.isoformat()
     b._auto_exits(prev_iso, fin)
+    b._mark_daily_between(prev_iso, fin)
     for p in b.positions:
         if not p.closed:
             spot = _spot_on_or_before(p.ticker, fin, b.px)
             b._close(p, fin, p.value_ps(spot, end_d.toordinal()), "final_liquidation")
-    b.equity_curve.append((fin, round(b.cash, 2)))
+    b._record_equity(fin, b.cash, b.equity_curve)
+    b._record_equity(fin, b.cash, b.daily_equity_curve)
 
     m = b.metrics()
     m["model"] = "rules_expert"
