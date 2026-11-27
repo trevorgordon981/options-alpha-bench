@@ -13,7 +13,13 @@ import json
 import os
 import statistics as st
 
-from data import PriceSnapshot, hydrate_price_snapshot, path_from, use_price_snapshot
+from data import (
+    PriceSnapshot,
+    PriceSnapshotSession,
+    hydrate_price_snapshot,
+    path_from,
+    use_price_snapshot,
+)
 from engine import Trade, simulate
 from llm_client import chat_completion
 from scenarios import generate
@@ -80,7 +86,7 @@ def parse_trade(text):
     return valid
 
 
-def hydrate_snapshot_for_setups(setups, *, get_closes_fn=None) -> PriceSnapshot:
+def hydrate_snapshot_for_setups(setups, *, get_closes_fn=None, session=None) -> PriceSnapshot:
     """Hydrate all price series needed for `setups` ONCE into an immutable PriceSnapshot."""
     windows: dict[str, tuple[str, str]] = {}
     for s in setups:
@@ -94,6 +100,9 @@ def hydrate_snapshot_for_setups(setups, *, get_closes_fn=None) -> PriceSnapshot:
             windows[tk] = (min(prev_lo, lo), max(prev_hi, hi))
         else:
             windows[tk] = (lo, hi)
+    if session is not None:
+        session.hydrate_windows(windows)
+        return session.freeze()
     return hydrate_price_snapshot(windows, get_closes_fn=get_closes_fn)
 
 
@@ -346,7 +355,10 @@ if __name__ == "__main__":
                     help="Allow model-specified stop_pct (labels policy variation explicitly)")
     ap.add_argument("--min-coverage", type=float, default=MIN_VALID_COVERAGE)
     a = ap.parse_args()
-    setups = generate()
+    snap_session = PriceSnapshotSession()
+    with use_price_snapshot(snap_session):
+        setups = generate(price_snapshot=snap_session)
+        snapshot = hydrate_snapshot_for_setups(setups, session=snap_session)
     print(f"{len(setups)} setups; scoring {a.limit or len(setups)} via {a.model}", flush=True)
     prov = {}
     rows = score(
@@ -356,6 +368,7 @@ if __name__ == "__main__":
         a.limit,
         allow_model_stop=a.allow_model_stop,
         checkpoint_path=f"{a.out}_cases.jsonl",
+        price_snapshot=snapshot,
         provenance_out=prov,
     )
     summ = summarize(rows, min_coverage=a.min_coverage)

@@ -73,8 +73,7 @@ def _closes_cached(ticker, start, end):
     return get_closes(ticker, start, end)
 
 
-def _spot_on_or_before(ticker, iso, cache, window_start=None, window_end=None):
-    """Most recent close at/before iso (handles weekends/holidays)."""
+def _ensure_ticker_cached(ticker, iso, cache, window_start=None, window_end=None):
     if ticker not in cache:
         d0 = date.fromisoformat(iso)
         lo = window_start if window_start else (d0 - timedelta(days=90)).isoformat()
@@ -82,8 +81,32 @@ def _spot_on_or_before(ticker, iso, cache, window_start=None, window_end=None):
         lo = min(lo, (d0 - timedelta(days=45)).isoformat())
         hi = max(hi, iso)
         cache[ticker] = get_closes(ticker, lo, hi)
-    items = [(k, v) for k, v in cache[ticker].items() if k <= iso]
-    return max(items)[1] if items else None
+    return cache[ticker]
+
+
+def _spot_on_date(ticker, iso, cache, window_start=None, window_end=None):
+    """Exact-date close on `iso`, or None if `ticker` has no bar on `iso` (OP12)."""
+    series = _ensure_ticker_cached(
+        ticker, iso, cache, window_start=window_start, window_end=window_end
+    )
+    return series.get(iso)
+
+
+def _spot_with_date_on_or_before(ticker, iso, cache, window_start=None, window_end=None):
+    """Return (bar_date, close) for the most recent close at/before `iso`, or (None, None)."""
+    series = _ensure_ticker_cached(
+        ticker, iso, cache, window_start=window_start, window_end=window_end
+    )
+    items = [(k, v) for k, v in series.items() if k <= iso]
+    return max(items) if items else (None, None)
+
+
+def _spot_on_or_before(ticker, iso, cache, window_start=None, window_end=None):
+    """Most recent close at/before iso (strictly for non-fill MTM or forced liquidation)."""
+    _, spot = _spot_with_date_on_or_before(
+        ticker, iso, cache, window_start=window_start, window_end=window_end
+    )
+    return spot
 
 
 def _is_weekday(iso: str) -> bool:
@@ -230,7 +253,7 @@ class Book:
         self.px = price_snapshot.to_dict() if price_snapshot is not None else {}
         self.verbose = verbose
 
-        # Distinct outcome counters (OP04, OP09)
+        # Distinct outcome counters (OP04, OP09, OP12)
         self.calls = 0
         self.decision_steps_run = 0
         self.valid_decisions = 0
@@ -239,6 +262,10 @@ class Book:
         self.parse_fails = 0
         self.schema_fails = 0
         self.invalid_actions = 0
+        self.missing_bar_rejections = 0
+        self.stale_liquidation_marks = 0
+        self._last_action_reject_reason = None
+        self.last_open_reject_reason = None
 
     @property
     def data_digest(self) -> str | None:
@@ -486,34 +513,59 @@ class Book:
         """Validate a schema-valid decision against exact open positions and market context.
 
         Returns None when all requested actions are semantically valid, or an explicit
-        error message when any requested action is impossible/unusable (OP09).
+        error message when any requested action is impossible/unusable (OP09, OP12).
         """
+        self._last_action_reject_reason = None
         if not _is_weekday(iso):
+            self._last_action_reject_reason = "non_trading_day"
             return f"decision date {iso!r} is not a valid trading weekday"
 
         open_by_pid = {p.pid: p for p in self.positions if not p.closed}
         seen_close = set()
         for idx, pid in enumerate(dec["close"]):
             if pid in seen_close:
+                self._last_action_reject_reason = "duplicate_close_id"
                 return f"close[{idx}]: duplicate position id {pid!r}"
             seen_close.add(pid)
             if pid not in open_by_pid:
+                self._last_action_reject_reason = "unknown_position_id"
                 return f"close[{idx}]: unknown or non-open position id {pid!r}"
             p = open_by_pid[pid]
-            spot = _spot_on_or_before(p.ticker, iso, self.px, window_start=self.start, window_end=self.end)
+            spot = _spot_on_date(p.ticker, iso, self.px, window_start=self.start, window_end=self.end)
             if spot is None:
-                return f"close[{idx}]: no market price available for {p.ticker} on {iso}"
+                prior_iso, _ = _spot_with_date_on_or_before(
+                    p.ticker, iso, self.px, window_start=self.start, window_end=self.end
+                )
+                if prior_iso is not None:
+                    self._last_action_reject_reason = "stale_bar_rejected"
+                    return (
+                        f"close[{idx}]: missing_close_bar (stale_bar_rejected): "
+                        f"no exact close bar for {p.ticker} on {iso} (latest prior bar: {prior_iso})"
+                    )
+                self._last_action_reject_reason = "missing_close_bar"
+                return f"close[{idx}]: missing_close_bar: no market price available for {p.ticker} on {iso}"
 
         for idx, spec in enumerate(dec["open"]):
             tk = spec["ticker"]
             if tk not in self.basket:
+                self._last_action_reject_reason = "ticker_not_in_basket"
                 return f"open[{idx}]: ticker {tk!r} not in tradable basket"
-            spot = _spot_on_or_before(tk, iso, self.px, window_start=self.start, window_end=self.end)
+            spot = _spot_on_date(tk, iso, self.px, window_start=self.start, window_end=self.end)
             if not spot:
-                return f"open[{idx}]: no market price available for {tk} on {iso}"
+                prior_iso, _ = _spot_with_date_on_or_before(
+                    tk, iso, self.px, window_start=self.start, window_end=self.end
+                )
+                self._last_action_reject_reason = "missing_entry_bar"
+                if prior_iso is not None:
+                    return (
+                        f"open[{idx}]: missing_entry_bar (stale_bar_rejected): "
+                        f"no exact close bar for {tk} on {iso} (latest prior bar: {prior_iso})"
+                    )
+                return f"open[{idx}]: missing_entry_bar: no market price available for {tk} on {iso}"
 
         remaining_open = len(open_by_pid) - len(dec["close"])
         if remaining_open + len(dec["open"]) > MAX_CONCURRENT:
+            self._last_action_reject_reason = "max_concurrent_exceeded"
             return (
                 f"open: requested {len(dec['open'])} new position(s) with {remaining_open} open "
                 f"would exceed MAX_CONCURRENT ({MAX_CONCURRENT})"
@@ -521,17 +573,29 @@ class Book:
         return None
 
     def _open(self, iso, spec, equity):
+        self.last_open_reject_reason = None
         if not _is_weekday(iso):
+            self.last_open_reject_reason = "non_trading_day"
             return None
         valid_spec, err = validate_book_open_spec(spec)
         if err is not None:
+            self.last_open_reject_reason = "invalid_open_spec"
             return None
         tk = valid_spec["ticker"]
         direction = valid_spec["direction"]
         if tk not in self.basket:
+            self.last_open_reject_reason = "ticker_not_in_basket"
             return None
-        spot = _spot_on_or_before(tk, iso, self.px, window_start=self.start, window_end=self.end)
+        # OP12: Require an exact-date symbol close bar for newly executed synthetic fills.
+        spot = _spot_on_date(tk, iso, self.px, window_start=self.start, window_end=self.end)
         if not spot:
+            prior_iso, _ = _spot_with_date_on_or_before(
+                tk, iso, self.px, window_start=self.start, window_end=self.end
+            )
+            self.last_open_reject_reason = (
+                "stale_bar_rejected" if prior_iso is not None else "missing_entry_bar"
+            )
+            self.missing_bar_rejections += 1
             return None
         dte = valid_spec["entry_dte"]
         delta = valid_spec["long_delta"]
@@ -581,7 +645,11 @@ class Book:
             dte = p.expiry_ord - date.fromisoformat(iso).toordinal()
             lines.append(f'  {p.pid}: {p.ticker} {p.direction} x{p.contracts}, {dte} DTE, P&L {pnl:+.0f}%')
         pos_block = "\n".join(lines) if lines else "  (none)"
-        sl = slate(self.basket, iso, top=8, price_snapshot=self.price_snapshot)
+        sl = [
+            c
+            for c in slate(self.basket, iso, top=len(self.basket), price_snapshot=self.price_snapshot)
+            if c.get("asof") == iso
+        ][:8]
         slate_block = "\n".join(
             f'  {c["ticker"]}: ${c["spot"]}, 5d {c["ret_5d"]*100:+.0f}%, 20d {c["ret_20d"]*100:+.0f}%, '
             f'{c["pct_below_high"]*100:.0f}% below high, rvol {c["rvol"]:.0%}' for c in sl)
@@ -666,7 +734,15 @@ Open [] to sit in cash. Never exceed {MAX_CONCURRENT} open positions."""
                         action_err = self._validate_step_actions(dec, iso)
                         if action_err is not None:
                             self.invalid_actions += 1
+                            if self._last_action_reject_reason in (
+                                "missing_entry_bar",
+                                "missing_close_bar",
+                                "stale_bar_rejected",
+                            ):
+                                self.missing_bar_rejections += 1
                             step_record["status"] = "invalid_action"
+                            if self._last_action_reject_reason:
+                                step_record["reject_reason"] = self._last_action_reject_reason
                             step_record["error"] = action_err
                             step_record["closed"] = []
                             step_record["opened"] = []
@@ -685,7 +761,7 @@ Open [] to sit in cash. Never exceed {MAX_CONCURRENT} open positions."""
                             for pid in dec["close"]:
                                 for p in self.positions:
                                     if p.pid == pid and not p.closed:
-                                        spot = _spot_on_or_before(
+                                        spot = _spot_on_date(
                                             p.ticker, iso, self.px,
                                             window_start=self.start, window_end=self.end,
                                         )
@@ -751,10 +827,12 @@ Open [] to sit in cash. Never exceed {MAX_CONCURRENT} open positions."""
             liq_ord = date.fromisoformat(liq_iso).toordinal()
 
             for p in open_positions:
-                spot = _spot_on_or_before(
+                bar_iso, spot = _spot_with_date_on_or_before(
                     p.ticker, liq_iso, self.px, window_start=self.start, window_end=self.end
                 )
                 if spot is not None:
+                    if bar_iso != liq_iso:
+                        self.stale_liquidation_marks += 1
                     self._close(p, liq_iso, p.value_ps(spot, liq_ord), "final_liquidation")
 
             final_eq = self.cash
@@ -844,6 +922,8 @@ Open [] to sit in cash. Never exceed {MAX_CONCURRENT} open positions."""
             "parse_fails": self.parse_fails,
             "schema_fails": self.schema_fails,
             "invalid_actions": self.invalid_actions,
+            "missing_bar_rejections": self.missing_bar_rejections,
+            "stale_liquidation_marks": self.stale_liquidation_marks,
             "coverage_pct": coverage_pct,
             "min_coverage_pct": round(self.min_coverage * 100.0, 1),
             "model_calls": self.calls,

@@ -14,7 +14,13 @@ import json
 import os
 from datetime import date, timedelta
 
-from book import Book, MAX_CONCURRENT, _spot_on_or_before
+from book import (
+    Book,
+    MAX_CONCURRENT,
+    _spot_on_date,
+    _spot_on_or_before,
+    _spot_with_date_on_or_before,
+)
 from market import slate as market_slate, context as market_context
 from scenarios import BASKET
 from expert_policy import expert_decision, cluster_of
@@ -122,7 +128,11 @@ def main():
             for pid in decision.get("close", []) or []:
                 for p in b.positions:
                     if p.pid == pid and not p.closed:
-                        spot = _spot_on_or_before(p.ticker, iso, b.px, window_start=START, window_end=END)
+                        spot = _spot_on_date(p.ticker, iso, b.px, window_start=START, window_end=END)
+                        if spot is None:
+                            b.missing_bar_rejections += 1
+                            closed_report.append(f"REJECT {pid} {p.ticker} (missing_close_bar)")
+                            continue
                         val = p.value_ps(spot, d_ord)
                         pnl = (val - p.entry_cost_ps) / p.entry_cost_ps * 100 if p.entry_cost_ps else 0
                         b._close(p, iso, val, "model_close")
@@ -163,8 +173,12 @@ def main():
         liq_ord = date.fromisoformat(liq_iso).toordinal()
         for p in b.positions:
             if not p.closed:
-                spot = _spot_on_or_before(p.ticker, liq_iso, b.px, window_start=START, window_end=END)
+                bar_iso, spot = _spot_with_date_on_or_before(
+                    p.ticker, liq_iso, b.px, window_start=START, window_end=END
+                )
                 if spot is not None:
+                    if bar_iso != liq_iso:
+                        b.stale_liquidation_marks += 1
                     b._close(p, liq_iso, p.value_ps(spot, liq_ord), "final_liquidation")
         if sessions or b.daily_equity_curve:
             b._record_equity(liq_iso, b.cash, b.equity_curve)

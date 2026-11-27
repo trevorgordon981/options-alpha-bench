@@ -192,6 +192,139 @@ class PriceSnapshot:
         return PriceSnapshot({tk: dict(self._series[tk]) for tk in sorted(wanted) if tk in self._series})
 
 
+class PriceSnapshotSession:
+    """Single-run write-once price session frozen BEFORE setup selection (OP08).
+
+    Pre-loads any currently cached on-disk ticker series once at session initialization
+    so subsequent cache mutations on disk cannot desynchronize setup selection,
+    hydration, prompt construction, scoring, simulation, or provenance digests.
+    For uncached tickers (e.g. cold live runs), bars are fetched on demand and frozen
+    write-once in memory (already-observed dates can never be overwritten).
+    """
+
+    def __init__(self, *, cache_dir: str | None = None, get_closes_fn=None):
+        self._fn = get_closes_fn if get_closes_fn is not None else get_closes
+        self._is_default_loader = (
+            (self._fn is _DEFAULT_GET_CLOSES) and (get_closes is _DEFAULT_GET_CLOSES)
+        )
+        self._cache_dir = cache_dir
+        self._series: dict[str, dict[str, float]] = {}
+        self._pinned: set[str] = set()
+        self._bounds: dict[str, tuple[str, str]] = {}
+        self._consumed: set[str] = set()
+
+        if self._is_default_loader:
+            root = cache_dir if cache_dir is not None else _get_cache_dir()
+            if os.path.isdir(root):
+                for name in sorted(os.listdir(root)):
+                    if not name.endswith(".json"):
+                        continue
+                    path = os.path.join(root, name)
+                    if not os.path.isfile(path):
+                        continue
+                    tk = os.path.splitext(name)[0].upper()
+                    try:
+                        with open(path, encoding="utf-8") as f:
+                            payload = json.load(f)
+                    except Exception:
+                        continue
+                    if not isinstance(payload, dict):
+                        continue
+                    bars = {
+                        str(k): round(float(v), 4)
+                        for k, v in payload.items()
+                        if not str(k).startswith("_")
+                        and isinstance(v, (int, float))
+                        and not isinstance(v, bool)
+                        and math.isfinite(float(v))
+                    }
+                    if not bars:
+                        continue
+                    self._series[tk] = bars
+                    if payload.get("_fixture_sha256"):
+                        self._pinned.add(tk)
+                    lo = payload.get("_start")
+                    hi = payload.get("_end")
+                    if isinstance(lo, str) and isinstance(hi, str):
+                        self._bounds[tk] = (lo, hi)
+
+    def _is_covered(self, tk: str, start: str, end: str) -> bool:
+        if tk not in self._series:
+            return False
+        if tk in self._pinned:
+            return True
+        bounds = self._bounds.get(tk)
+        if bounds is None:
+            return False
+        return bounds[0] <= start and bounds[1] >= end
+
+    def get_closes(self, ticker: str, start: str, end: str) -> dict[str, float]:
+        tk = str(ticker).upper()
+        self._consumed.add(tk)
+        if not self._is_covered(tk, start, end):
+            with use_price_snapshot(None):
+                fetched = self._fn(tk, start, end)
+            dest = self._series.setdefault(tk, {})
+            if isinstance(fetched, dict):
+                for d, v in fetched.items():
+                    if (
+                        not str(d).startswith("_")
+                        and isinstance(v, (int, float))
+                        and not isinstance(v, bool)
+                        and math.isfinite(float(v))
+                    ):
+                        dest.setdefault(str(d), round(float(v), 4))
+            if self._is_default_loader:
+                try:
+                    cp = (
+                        os.path.join(self._cache_dir, f"{tk}.json")
+                        if self._cache_dir is not None
+                        else _cache_path(tk)
+                    )
+                    for d, v in _read_cached_bars_file(cp).items():
+                        dest.setdefault(d, v)
+                except Exception:
+                    pass
+            prev = self._bounds.get(tk)
+            if prev is None:
+                self._bounds[tk] = (start, end)
+            else:
+                self._bounds[tk] = (min(prev[0], start), max(prev[1], end))
+        bars = self._series.get(tk)
+        if not bars:
+            return {}
+        return {k: v for k, v in bars.items() if start <= k <= end}
+
+    def path_from(self, ticker: str, entry_date: str, days_forward: int = 220):
+        d0 = date.fromisoformat(entry_date)
+        start = (d0 - timedelta(days=45)).isoformat()
+        end = (d0 + timedelta(days=days_forward)).isoformat()
+        closes = self.get_closes(ticker, start, end)
+        items = sorted(closes.items())
+        pre = [(d, c) for d, c in items if d < entry_date]
+        fwd = [(d, c) for d, c in items if d >= entry_date]
+        return pre, fwd
+
+    def hydrate_windows(self, ticker_windows: dict[str, tuple[str, str]]) -> None:
+        for raw_tk in sorted(ticker_windows):
+            lo, hi = ticker_windows[raw_tk]
+            try:
+                self.get_closes(raw_tk, lo, hi)
+            except Exception:
+                continue
+
+    def freeze(self, tickers=None) -> PriceSnapshot:
+        if tickers is not None:
+            wanted = {str(tk).upper() for tk in tickers}
+        elif self._consumed:
+            wanted = set(self._consumed)
+        else:
+            wanted = set(self._series.keys())
+        return PriceSnapshot(
+            {tk: dict(self._series[tk]) for tk in sorted(wanted) if self._series.get(tk)}
+        )
+
+
 @contextmanager
 def use_price_snapshot(snapshot: "PriceSnapshot | None"):
     """Bind an immutable PriceSnapshot for all data lookups in this execution context."""

@@ -281,13 +281,26 @@ def run(
         construction_summ = rma_mod.summarize
         hydrate_setups_fn = getattr(rma_mod, "hydrate_snapshot_for_setups", None)
 
-        setups = generate()
         c_snapshot = None
         if (
             _accepts_explicit_kwarg(construction_score, "price_snapshot")
             and callable(hydrate_setups_fn)
         ):
-            c_snapshot = hydrate_setups_fn(setups)
+            from data import PriceSnapshotSession, use_price_snapshot
+
+            # OP08: Freeze a single price session BEFORE setup selection so selection,
+            # hydration, prompt construction, scoring, simulation, and scorecard digest
+            # can never consume different price revisions.
+            snap_session = PriceSnapshotSession()
+            with use_price_snapshot(snap_session):
+                if _accepts_explicit_kwarg(generate, "price_snapshot"):
+                    setups = generate(price_snapshot=snap_session)
+                else:
+                    setups = generate()
+                if _accepts_explicit_kwarg(hydrate_setups_fn, "session"):
+                    c_snapshot = hydrate_setups_fn(setups, session=snap_session)
+                else:
+                    c_snapshot = snap_session.freeze()
             if c_snapshot is not None and len(c_snapshot) > 0:
                 snap_c_identity = _cache_identity(
                     "construction_alpha",
@@ -301,6 +314,8 @@ def run(
                 csum = _load_cached(snap_csum_path, snap_c_identity)
                 if csum is not None:
                     c_identity = snap_c_identity
+        else:
+            setups = generate()
 
         if csum is None:
             active_ctag = (

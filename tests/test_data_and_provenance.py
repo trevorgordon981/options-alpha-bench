@@ -496,6 +496,148 @@ class TestCacheProvenanceAndCompareOP08(unittest.TestCase):
             self.assertNotEqual(card["provenance"]["book_backtest"]["data_digest"], digest_200)
             self.assertEqual(card["book_backtest"]["data_digest"], digest_100)
 
+    def test_selection_time_cache_mutation_cannot_desync_prompt_scoring_or_digest_op08(self):
+        """OP08 exact repro: cache revision ($110 -> $90) after setup selection cannot desync prompt, simulation, or digest."""
+        from datetime import date, timedelta
+        import run_model_alpha
+
+        px_dir = os.path.join(self.tmpdir.name, "px_sel_mut")
+        out_dir = os.path.join(self.tmpdir.name, "out_sel_mut")
+        os.makedirs(px_dir, exist_ok=True)
+        os.makedirs(out_dir, exist_ok=True)
+
+        entry = date(2025, 1, 2)
+        base_bars = {(entry - timedelta(days=days)).isoformat(): 100.0 for days in range(1, 24)}
+        before_bars = {**base_bars, "2025-01-02": 110.0, "2025-01-03": 112.0, "2025-01-06": 116.0}
+        after_bars = {**before_bars, "2025-01-02": 90.0}
+
+        meta = {
+            "_schema_version": 2,
+            "_source": "synthetic_test",
+            "_fixture_sha256": "pinned-selection-fixture",
+            "_start": "2024-01-01",
+            "_end": "2026-01-01",
+        }
+        nvda_path = os.path.join(px_dir, "NVDA.json")
+        with open(nvda_path, "w", encoding="utf-8") as f:
+            json.dump({**meta, **before_bars}, f, sort_keys=True)
+
+        digest_110 = data.PriceSnapshot({"NVDA": before_bars}).digest()
+        digest_90 = data.PriceSnapshot({"NVDA": after_bars}).digest()
+        self.assertNotEqual(digest_110, digest_90)
+
+        native_generate = scenarios.generate
+        prompts_run1 = []
+        recomputed_inside_run1 = []
+
+        def _mutating_generate():
+            args = {"start": "2025-01-02", "end": "2025-01-02", "basket": ["NVDA"]}
+            picked = native_generate(**args)
+            self.assertEqual(len(picked), 1)
+            self.assertEqual(picked[0]["mom20"], 0.10)
+            self.assertEqual(picked[0]["direction"], "long_call")
+            # Mutate on-disk cache immediately after setup selection ($110 -> $90)
+            with open(nvda_path, "w", encoding="utf-8") as f:
+                json.dump({**meta, **after_bars}, f, sort_keys=True)
+            # Inside the same frozen construction session, re-running selection still sees $110
+            recomputed = native_generate(**args)
+            recomputed_inside_run1.extend(recomputed)
+            return picked
+
+        def _capture_call(prompt, base, model, **kwargs):
+            prompts_run1.append(prompt)
+            return json.dumps({
+                "direction": "long_call",
+                "entry_dte": 35,
+                "long_delta": 0.60,
+                "stop_pct": 0.30,
+                "conviction": "high",
+            })
+
+        with mock.patch.dict(os.environ, {"BYRON_CACHE": px_dir}):
+            fake_yf = mock.MagicMock()
+            fake_yf.download.side_effect = AssertionError("unexpected price fetch")
+            with mock.patch("sys.stdout", new=io.StringIO()), \
+                 mock.patch.object(scenarios, "generate", side_effect=_mutating_generate), \
+                 mock.patch.object(run_model_alpha, "call_model", side_effect=_capture_call), \
+                 mock.patch.object(data, "yf", fake_yf):
+                card1 = bench.run(
+                    "sel_mut_audit",
+                    "http://127.0.0.1:8082",
+                    "model-v1",
+                    "2025-01-02",
+                    "2025-01-06",
+                    7,
+                    skip_book=True,
+                    cache_dir=out_dir,
+                    model_revision="fixture-selection",
+                )
+            self.assertFalse(fake_yf.download.called)
+
+            # Even the second native_generate inside the session remained pinned to $110 (+10%)
+            self.assertEqual(len(recomputed_inside_run1), 1)
+            self.assertEqual(recomputed_inside_run1[0]["mom20"], 0.10)
+            self.assertEqual(recomputed_inside_run1[0]["direction"], "long_call")
+
+            # Prompt MUST combine $110.00 spot with +10.0% momentum (NEVER $90.00 + +10.0%!)
+            self.assertEqual(len(prompts_run1), 1)
+            self.assertIn("Spot: $110.00", prompts_run1[0])
+            self.assertIn("+10.0%", prompts_run1[0])
+            self.assertNotIn("Spot: $90.00", prompts_run1[0])
+
+            # Provenance digest MUST bind the exact $110 snapshot, NOT the mutated $90 disk file!
+            c_id = card1["provenance"]["construction_alpha"]
+            self.assertEqual(c_id["data_digest"], digest_110)
+            self.assertNotEqual(c_id["data_digest"], digest_90)
+
+            ctag = bench._cache_tag("model_alpha", "sel_mut_audit", c_id)
+            with open(os.path.join(out_dir, f"{ctag}_rows.json"), encoding="utf-8") as f:
+                saved_rows = json.load(f)
+            self.assertEqual(len(saved_rows), 1)
+            # Underlying return reflects $110 -> $116 (+5.45%), NOT $90 -> $116 (+28.89%)
+            self.assertAlmostEqual(saved_rows[0]["underlying_ret"], (116.0 - 110.0) / 110.0, places=4)
+            self.assertEqual(saved_rows[0]["data_digest"], digest_110)
+
+            # A fresh subsequent run on the now-$90 disk cache must consistently select -10% & $90.00
+            prompts_run2 = []
+
+            def _capture_call_run2(prompt, base, model, **kwargs):
+                prompts_run2.append(prompt)
+                return json.dumps({
+                    "direction": "long_put",
+                    "entry_dte": 35,
+                    "long_delta": 0.60,
+                    "stop_pct": 0.30,
+                    "conviction": "high",
+                })
+
+            with mock.patch("sys.stdout", new=io.StringIO()), \
+                 mock.patch.object(
+                     scenarios,
+                     "generate",
+                     side_effect=lambda **kw: native_generate(
+                         start="2025-01-02", end="2025-01-02", basket=["NVDA"], **kw
+                     ),
+                 ), \
+                 mock.patch.object(run_model_alpha, "call_model", side_effect=_capture_call_run2), \
+                 mock.patch.object(data, "yf", fake_yf):
+                card2 = bench.run(
+                    "sel_mut_audit",
+                    "http://127.0.0.1:8082",
+                    "model-v1",
+                    "2025-01-02",
+                    "2025-01-06",
+                    7,
+                    skip_book=True,
+                    cache_dir=out_dir,
+                    model_revision="fixture-selection",
+                )
+            self.assertFalse(fake_yf.download.called)
+            self.assertEqual(len(prompts_run2), 1)
+            self.assertIn("Spot: $90.00", prompts_run2[0])
+            self.assertIn("-10.0%", prompts_run2[0])
+            self.assertEqual(card2["provenance"]["construction_alpha"]["data_digest"], digest_90)
+
 
 if __name__ == "__main__":
     unittest.main()

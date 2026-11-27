@@ -536,5 +536,143 @@ class TestTradingSessionSchedulingAndChronologyOP11(unittest.TestCase):
             b._close(pos, "2025-01-03", 5.0, "final_liquidation")
 
 
+class TestExactBarExecutionOP12(unittest.TestCase):
+    def test_missing_symbol_close_on_valid_session_rejects_stale_fill_op12(self):
+        """OP12 exact repro: SPY Fri+Mon with NVDA Fri-only MUST reject Monday NVDA open instead of filling at stale Friday $80."""
+        import data
+
+        snapshot = data.PriceSnapshot({
+            "SPY": {"2025-01-03": 100.0, "2025-01-06": 101.0},
+            "NVDA": {"2025-01-03": 80.0},
+        })
+        b = book.Book(
+            "mock",
+            "mock",
+            start="2025-01-03",
+            end="2025-01-06",
+            step_days=2,
+            mark_frequency="daily",
+            price_snapshot=snapshot,
+            verbose=False,
+        )
+        open_order = (
+            '{"open":[{"ticker":"NVDA","direction":"long_call",'
+            '"entry_dte":35,"long_delta":0.6,"size_pct":0.1}],"close":[]}'
+        )
+        with mock.patch.object(b, "_call", side_effect=['{"open":[],"close":[]}', open_order]), \
+             mock.patch.object(book, "strike_for_delta", wraps=book.strike_for_delta) as strike:
+            m = b.run()
+
+        # Stale Friday $80 MUST NEVER be used to price or fill a Monday trade
+        self.assertEqual(strike.call_count, 0)
+        self.assertEqual(len(b.positions), 0)
+        self.assertEqual(len(b.closed), 0)
+        self.assertEqual(b.cash, book.START_EQUITY)
+        self.assertEqual(m["n_trades"], 0)
+        self.assertEqual(m["decision_steps"], 2)
+        self.assertEqual(m["valid_decisions"], 1)
+        self.assertEqual(m["invalid_actions"], 1)
+        self.assertEqual(m["missing_bar_rejections"], 1)
+        self.assertEqual(m["stale_liquidation_marks"], 0)
+        self.assertEqual(m["verdict"], "INVALID")
+        self.assertFalse(m["qualifying"])
+        self.assertIsNone(m["alpha_vs_spy_cagr_pct"])
+        self.assertEqual(b.step_log[1]["status"], "invalid_action")
+        self.assertEqual(b.step_log[1]["reject_reason"], "missing_entry_bar")
+        self.assertIn("stale_bar_rejected", b.step_log[1]["error"])
+
+    def test_direct_open_rejects_missing_entry_bar_and_records_reason_op12(self):
+        import data
+
+        snapshot = data.PriceSnapshot({
+            "SPY": {"2025-01-03": 100.0, "2025-01-06": 101.0},
+            "NVDA": {"2025-01-03": 80.0},
+        })
+        b = book.Book(
+            "mock",
+            "mock",
+            start="2025-01-03",
+            end="2025-01-06",
+            step_days=2,
+            price_snapshot=snapshot,
+            verbose=False,
+        )
+        spec = {
+            "ticker": "NVDA",
+            "direction": "long_call",
+            "entry_dte": 35,
+            "long_delta": 0.6,
+            "size_pct": 0.1,
+        }
+        with mock.patch.object(book, "strike_for_delta", wraps=book.strike_for_delta) as strike:
+            opened = b._open("2025-01-06", spec, book.START_EQUITY)
+
+        self.assertIsNone(opened)
+        self.assertEqual(strike.call_count, 0)
+        self.assertEqual(b.last_open_reject_reason, "stale_bar_rejected")
+        self.assertEqual(b.missing_bar_rejections, 1)
+        self.assertEqual(b.cash, book.START_EQUITY)
+
+    def test_exact_monday_bar_control_fills_and_missing_close_tracks_stale_liquidation_op12(self):
+        import data
+
+        # Control: when NVDA HAS an exact Monday bar ($85), Monday open fills cleanly at $85
+        full_snap = data.PriceSnapshot({
+            "SPY": {"2025-01-03": 100.0, "2025-01-06": 101.0},
+            "NVDA": {"2025-01-03": 80.0, "2025-01-06": 85.0},
+        })
+        b_ok = book.Book(
+            "mock",
+            "mock",
+            start="2025-01-03",
+            end="2025-01-06",
+            step_days=2,
+            mark_frequency="daily",
+            price_snapshot=full_snap,
+            verbose=False,
+        )
+        open_order = (
+            '{"open":[{"ticker":"NVDA","direction":"long_call",'
+            '"entry_dte":35,"long_delta":0.6,"size_pct":0.1}],"close":[]}'
+        )
+        with mock.patch.object(b_ok, "_call", side_effect=['{"open":[],"close":[]}', open_order]), \
+             mock.patch.object(book, "strike_for_delta", wraps=book.strike_for_delta) as strike:
+            m_ok = b_ok.run()
+
+        self.assertEqual(strike.call_count, 1)
+        self.assertEqual(strike.call_args.args[0], 85.0)
+        self.assertEqual(m_ok["verdict"], "VALID")
+        self.assertEqual(m_ok["n_trades"], 1)
+        self.assertEqual(m_ok["missing_bar_rejections"], 0)
+        self.assertEqual(m_ok["stale_liquidation_marks"], 0)
+        self.assertEqual(b_ok.closed[0].entry_date, "2025-01-06")
+
+        # Missing Monday bar for an ALREADY-OPEN Friday position:
+        # model close on Monday is rejected, while final liquidation explicitly tracks stale mark.
+        gap_snap = data.PriceSnapshot({
+            "SPY": {"2025-01-03": 100.0, "2025-01-06": 101.0},
+            "NVDA": {"2025-01-03": 80.0},
+        })
+        b_liq = book.Book(
+            "mock",
+            "mock",
+            start="2025-01-03",
+            end="2025-01-06",
+            step_days=2,
+            mark_frequency="daily",
+            price_snapshot=gap_snap,
+            verbose=False,
+        )
+        with mock.patch.object(b_liq, "_call", side_effect=[open_order, '{"open":[],"close":["p1"]}']):
+            m_liq = b_liq.run()
+
+        self.assertEqual(m_liq["missing_bar_rejections"], 1)
+        self.assertEqual(b_liq.step_log[1]["status"], "invalid_action")
+        self.assertEqual(b_liq.step_log[1]["reject_reason"], "stale_bar_rejected")
+        self.assertEqual(m_liq["stale_liquidation_marks"], 1)
+        self.assertEqual(len(b_liq.closed), 1)
+        self.assertEqual(b_liq.closed[0].exit_reason, "final_liquidation")
+
+
 if __name__ == "__main__":
     unittest.main()

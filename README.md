@@ -72,19 +72,24 @@ Both `run_model_alpha.py` and `book.py` share `llm_client.py`:
   `open: [null]`, out-of-range deltas/sizes/DTEs) become explicit failed rows/steps
   instead of aborting a run or being silently coerced. Terminal case/step outcomes
   are appended and fsynced to JSONL checkpoints.
-- **Chronological trading-session execution & marks (`book.py`):** Decision schedules
-  map nominal cadences strictly onto valid trading sessions within `[start, end]`
+- **Chronological trading-session execution & exact-bar fills (`book.py`):** Decision
+  schedules map nominal cadences strictly onto valid trading sessions within `[start, end]`
   (deferring weekend/holiday dates to the next valid session in window, or skipping
   cleanly when none remain), auto-exits and daily equity marks advance together along
   one chronological trading-session timeline (zero lookahead from future exits), and
-  every close/liquidation enforces `exit_date >= entry_date`. Final liquidation occurs
-  on the final valid trading session and replaces the terminal mark cleanly; annualization
-  uses the configured sampling frequency (`365.25 / step_days` for step marks, `252` for
-  daily trading-session marks).
+  every close/liquidation enforces `exit_date >= entry_date`. Newly executed synthetic
+  fills require an exact-date symbol close bar (`date == entry_date`); symbols missing a
+  close on the decision session fail closed (`missing_entry_bar` / `stale_bar_rejected`)
+  rather than filling on a stale prior-day close, while prior-bar carry-forward is
+  restricted to non-fill mark-to-market and explicitly counted forced liquidations
+  (`stale_liquidation_marks`). Final liquidation occurs on the final valid trading session
+  and replaces the terminal mark cleanly; annualization uses the configured sampling
+  frequency (`365.25 / step_days` for step marks, `252` for daily trading-session marks).
 - **Frozen consumed-data provenance caching (`bench.py`, `data.py`):** Each track
-  hydrates its required price series once into an immutable in-memory `PriceSnapshot`
-  before model calls begin, binds all prompt/pricing/valuation lookups to that snapshot,
-  and hashes the exact consumed in-memory price bytes into `data_digest` (immune to
+  initializes a single frozen in-memory `PriceSnapshot` / `PriceSnapshotSession`
+  **before** setup selection and model calls begin, threads that exact snapshot through
+  setup generation, hydration, prompt construction, scoring, and simulation, and hashes
+  the exact consumed in-memory price bytes into `data_digest` (immune to pre-hydration or
   mid-run mutation of on-disk cache files). Track caches bind model ID, optional
   `--model-revision`, endpoint base, run parameters, and SHA-256 digests of source code,
   prompt templates, and consumed prices, written atomically. `bench.py compare` flags
