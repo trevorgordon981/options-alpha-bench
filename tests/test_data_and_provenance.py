@@ -207,6 +207,107 @@ class TestCacheProvenanceAndCompareOP08(unittest.TestCase):
         self.assertTrue(any("INVALID" in r for r in res["incomparable_reasons"]))
         self.assertTrue(any("date windows" in r for r in res["incomparable_reasons"]))
         self.assertTrue(any("code_digest" in r for r in res["incomparable_reasons"]))
+        self.assertTrue(any("model_revision" in r for r in res["incomparable_reasons"]))
+
+    def test_post_hydration_data_digest_consistency_op08(self):
+        """OP08 exact repro: cache hydration during bench.run() must bind POST-hydration data_digest."""
+        import types
+
+        px_dir = os.path.join(self.tmpdir.name, "px_cold")
+        out_dir = os.path.join(self.tmpdir.name, "out")
+        os.makedirs(px_dir, exist_ok=True)
+        os.makedirs(out_dir, exist_ok=True)
+
+        with mock.patch.dict(os.environ, {"BYRON_CACHE": px_dir}):
+            empty_digest = bench._data_digest(px_dir)
+            # Empty cache SHA-256 prefix
+            self.assertEqual(empty_digest, "e3b0c44298fc1c14")
+
+            calls = {"construction": 0, "book": 0}
+
+            def _hydrate_cache(ticker, payload):
+                with open(os.path.join(px_dir, f"{ticker}.json"), "w", encoding="utf-8") as f:
+                    json.dump(payload, f, sort_keys=True)
+
+            scenarios_mod = types.ModuleType("scenarios")
+            scenarios_mod.generate = lambda: [
+                {"ticker": "NVDA", "entry_date": "2024-03-04", "horizon_days": 21, "mom20": 0.12}
+            ]
+
+            rma_mod = types.ModuleType("run_model_alpha")
+
+            def fake_score(setups, base, model, **kwargs):
+                calls["construction"] += 1
+                # Simulate live hydration of price cache during track execution
+                _hydrate_cache("NVDA", {"_start": "2024-01-01", "_end": "2024-06-01", "2024-03-04": 85.0})
+                return [{"status": "ok", "model_ret": 0.15, "model_dte": 168, "doctrine_ret": 0.05}]
+
+            def fake_summarize(rows, **kwargs):
+                return {"verdict": "VALID", "qualifying": True, "n_ok": len(rows), "n_total": len(rows)}
+
+            rma_mod.score = fake_score
+            rma_mod.summarize = fake_summarize
+
+            book_mod = types.ModuleType("book")
+
+            class HydratingBook:
+                def __init__(self, base, model, start, end, step, **kwargs):
+                    self.equity_curve = [(start, 100000.0), (end, 105000.0)]
+
+                def run(self):
+                    calls["book"] += 1
+                    _hydrate_cache("SPY", {"_start": "2024-01-01", "_end": "2024-06-01", "2024-03-04": 510.0})
+                    return {"verdict": "VALID", "qualifying": True, "cagr_pct": 10.0}
+
+            book_mod.Book = HydratingBook
+
+            with mock.patch.dict(sys.modules, {
+                "scenarios": scenarios_mod,
+                "run_model_alpha": rma_mod,
+                "book": book_mod,
+            }):
+                card = bench.run(
+                    "hydrated_run",
+                    "http://127.0.0.1:8082",
+                    "model-v1",
+                    "2024-03-01",
+                    "2024-06-01",
+                    7,
+                    cache_dir=out_dir,
+                    model_revision="sha256:rev1",
+                )
+                post_digest = bench._data_digest(px_dir)
+
+                # Post-hydration digest MUST differ from pre-run empty digest
+                self.assertNotEqual(post_digest, empty_digest)
+                # Neither track may record the stale pre-run empty hash!
+                self.assertNotEqual(card["provenance"]["construction_alpha"]["data_digest"], empty_digest)
+                self.assertEqual(card["provenance"]["book_backtest"]["data_digest"], post_digest)
+
+                # Verify cached artifact on disk binds the post-hydration digest
+                b_id = card["provenance"]["book_backtest"]
+                b_path = os.path.join(
+                    out_dir, f"{bench._cache_tag('book', 'hydrated_run', b_id)}_metrics.json"
+                )
+                self.assertTrue(os.path.exists(b_path))
+                with open(b_path, encoding="utf-8") as f:
+                    cached_book = json.load(f)
+                self.assertEqual(cached_book[bench.CACHE_META_KEY]["data_digest"], post_digest)
+
+                # Re-running with now-hydrated cache MUST hit book cache cleanly (0 extra calls)
+                card2 = bench.run(
+                    "hydrated_run",
+                    "http://127.0.0.1:8082",
+                    "model-v1",
+                    "2024-03-01",
+                    "2024-06-01",
+                    7,
+                    skip_construction=True,
+                    cache_dir=out_dir,
+                    model_revision="sha256:rev1",
+                )
+                self.assertEqual(calls["book"], 1)
+                self.assertEqual(card2["provenance"]["book_backtest"]["data_digest"], post_digest)
 
 
 if __name__ == "__main__":

@@ -60,25 +60,30 @@ Both `run_model_alpha.py` and `book.py` share `llm_client.py`:
 
 ## Evaluation integrity guarantees
 
-- **Coverage-gated validity:** Runs with zero valid decisions or coverage below
-  `--min-coverage` (default `80%`) are flagged `verdict: "INVALID"` (`qualifying: false`),
-  and performance/alpha fields (`cagr_pct`, `sharpe`, `alpha_vs_spy_cagr_pct`,
-  `alpha_vs_doctrine_pct`) are suppressed to `null`. Deliberate cash abstentions
-  (`{"close": [], "open": []}`) are counted separately from transport, parse, and
-  schema failures.
+- **Coverage-gated validity & semantic action checks:** Runs with zero valid decisions
+  or coverage below `--min-coverage` (default `80%`) are flagged `verdict: "INVALID"`
+  (`qualifying: false`), and performance/alpha fields (`cagr_pct`, `sharpe`,
+  `alpha_vs_spy_cagr_pct`, `alpha_vs_doctrine_pct`) are suppressed to `null`.
+  Deliberate cash abstentions (`{"close": [], "open": []}`) are tracked separately from
+  transport, parse, schema, and semantically invalid/impossible action failures (such as
+  closing unknown/non-open position IDs or opening tickers outside the basket).
 - **Strict typed schema & durable replay (`schema.py`):** Malformed JSON replies
   (wrong types, `NaN`/infinite numbers, booleans where integers are required,
   `open: [null]`, out-of-range deltas/sizes/DTEs) become explicit failed rows/steps
   instead of aborting a run or being silently coerced. Terminal case/step outcomes
   are appended and fsynced to JSONL checkpoints.
-- **Statistical accuracy (`book.py`):** Final liquidation replaces the terminal
-  date mark rather than appending a duplicate date. Annualization uses the
-  configured sampling frequency (`365.25 / step_days` for step marks, `252` for
-  daily trading-session marks), and daily trading-session marks capture intraperiod
-  drawdowns.
-- **Provenance-bound atomic caching (`bench.py`):** Track caches bind model ID,
+- **Chronological trading-session marks (`book.py`):** Auto-exits and daily equity
+  marks advance together along a single chronological trading-session timeline
+  (zero lookahead from future exits; weekends and non-trading decision dates stay out
+  of the 252-annualized daily return series). Final liquidation replaces the terminal
+  mark rather than appending a duplicate date, and annualization uses the configured
+  sampling frequency (`365.25 / step_days` for step marks, `252` for daily trading-session
+  marks).
+- **Post-hydration provenance caching (`bench.py`):** Track caches bind model ID,
   optional `--model-revision`, endpoint base, run parameters, and SHA-256 digests
-  of source code, prompt templates, and price cache files, written atomically.
+  of source code, prompt templates, and price cache files computed **after** cache
+  hydration/updates against the exact data consumed, written atomically. `bench.py compare`
+  flags unverified alias-only builds lacking `model_revision`.
 
 ## Methodology & simulation limits
 

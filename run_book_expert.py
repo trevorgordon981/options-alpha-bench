@@ -84,17 +84,21 @@ def main():
     b = Book(base="", model="rules_expert", start=START, end=END, step_days=STEP, verbose=False)
     d = date.fromisoformat(START)
     end_d = date.fromisoformat(END)
-    prev_iso = START
+    last_advanced_iso = None
     peak_equity = 0.0
     trace = []
 
     while d <= end_d:
         iso = d.isoformat()
-        b._auto_exits(prev_iso, iso)
-        b._mark_daily_between(prev_iso, iso)
+        if last_advanced_iso is None:
+            b._advance_sessions(START, iso, include_start=True)
+        else:
+            b._advance_sessions(last_advanced_iso, iso, include_start=False)
+        last_advanced_iso = iso
         equity = b._mark_equity(iso)
-        b._record_equity(iso, equity, b.equity_curve)
-        b._record_equity(iso, equity, b.daily_equity_curve)
+        b._record_equity(iso, equity, b.decision_equity_curve)
+        if b.mark_frequency == "step":
+            b._record_equity(iso, equity, b.equity_curve)
         peak_equity = max(peak_equity, equity)
 
         state = build_state(b, iso, equity, peak_equity)
@@ -137,19 +141,21 @@ def main():
             "applied": {"closed": closed_report, "opened": opened_report,
                         "cash_after": round(b.cash, 2)},
         })
-        prev_iso = iso
         d += timedelta(days=STEP)
 
     # ---- final liquidation (replace terminal mark cleanly) ----
     fin = end_d.isoformat()
-    b._auto_exits(prev_iso, fin)
-    b._mark_daily_between(prev_iso, fin)
+    if last_advanced_iso is None:
+        b._advance_sessions(START, fin, include_start=True)
+    else:
+        b._advance_sessions(last_advanced_iso, fin, include_start=False)
     for p in b.positions:
         if not p.closed:
             spot = _spot_on_or_before(p.ticker, fin, b.px)
             b._close(p, fin, p.value_ps(spot, end_d.toordinal()), "final_liquidation")
     b._record_equity(fin, b.cash, b.equity_curve)
-    b._record_equity(fin, b.cash, b.daily_equity_curve)
+    if b.daily_equity_curve and b.daily_equity_curve[-1][0] == fin:
+        b._record_equity(fin, b.cash, b.daily_equity_curve)
 
     m = b.metrics()
     m["model"] = "rules_expert"

@@ -149,6 +149,28 @@ class TestStrictSchemaAndDurableReplayOP02(unittest.TestCase):
             self.assertIsNone(valid, f"Should have rejected {bad!r}")
             self.assertIsNotNone(err)
 
+    def test_book_schema_rejects_unknown_and_duplicate_close_ids(self):
+        valid, err = schema.validate_book_decision(
+            {"close": ["never_opened"], "open": []},
+            open_position_ids={"p1"},
+        )
+        self.assertIsNone(valid)
+        self.assertIn("never_opened", err)
+
+        valid_dup, err_dup = schema.validate_book_decision(
+            {"close": ["p1", "p1"], "open": []},
+            open_position_ids={"p1"},
+        )
+        self.assertIsNone(valid_dup)
+        self.assertIn("duplicate", err_dup)
+
+        valid_ok, err_ok = schema.validate_book_decision(
+            {"close": ["p1"], "open": []},
+            open_position_ids={"p1"},
+        )
+        self.assertEqual(valid_ok, {"close": ["p1"], "open": []})
+        self.assertIsNone(err_ok)
+
     def test_construction_replay_survives_bad_field_types_and_persists_jsonl(self):
         setups = [
             {"ticker": "NVDA", "entry_date": "2024-03-04", "horizon_days": 21, "mom20": 0.12},

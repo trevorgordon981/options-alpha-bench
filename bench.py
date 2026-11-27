@@ -260,20 +260,22 @@ def run(
         c_params["model_revision"] = model_revision
     if min_coverage != DEFAULT_MIN_COVERAGE:
         c_params["min_coverage"] = min_coverage
-    c_identity = _cache_identity("construction_alpha", model, base, **c_params)
-    ctag = _cache_tag("model_alpha", name, c_identity)
-    csum_path = os.path.join(out_dir, f"{ctag}_summary.json")
-    csum = _load_cached(csum_path, c_identity)
+    pre_c_identity = _cache_identity("construction_alpha", model, base, **c_params)
+    pre_ctag = _cache_tag("model_alpha", name, pre_c_identity)
+    pre_csum_path = os.path.join(out_dir, f"{pre_ctag}_summary.json")
+    csum = _load_cached(pre_csum_path, pre_c_identity)
+    c_identity = pre_c_identity
     if csum is None and not skip_construction:
         from run_model_alpha import score as construction_score, summarize as construction_summ
         from scenarios import generate
 
         setups = generate()
+        pre_ckpt_path = os.path.join(out_dir, f"{pre_ctag}_cases.jsonl")
         score_kwargs = {}
         if _accepts_kwarg(construction_score, "allow_model_stop"):
             score_kwargs["allow_model_stop"] = allow_model_stop
         if _accepts_kwarg(construction_score, "checkpoint_path"):
-            score_kwargs["checkpoint_path"] = os.path.join(out_dir, f"{ctag}_cases.jsonl")
+            score_kwargs["checkpoint_path"] = pre_ckpt_path
         if _accepts_kwarg(construction_score, "api_key"):
             score_kwargs["api_key"] = api_key
         if _accepts_kwarg(construction_score, "api_key_env"):
@@ -283,6 +285,12 @@ def run(
         if _accepts_kwarg(construction_summ, "min_coverage"):
             summ_kwargs["min_coverage"] = min_coverage
         csum = construction_summ(rows, **summ_kwargs)
+        # Recompute provenance digest AFTER cache hydration/updates (OP08)
+        c_identity = _cache_identity("construction_alpha", model, base, **c_params)
+        ctag = _cache_tag("model_alpha", name, c_identity)
+        csum_path = os.path.join(out_dir, f"{ctag}_summary.json")
+        if ctag != pre_ctag and os.path.exists(pre_ckpt_path):
+            os.replace(pre_ckpt_path, os.path.join(out_dir, f"{ctag}_cases.jsonl"))
         _write_json(os.path.join(out_dir, f"{ctag}_rows.json"), rows, indent=2)
         _save_cached(csum_path, csum, c_identity)
     card["construction_alpha"] = csum
@@ -294,13 +302,15 @@ def run(
         b_params["model_revision"] = model_revision
     if min_coverage != DEFAULT_MIN_COVERAGE:
         b_params["min_coverage"] = min_coverage
-    b_identity = _cache_identity("book_backtest", model, base, **b_params)
-    btag = _cache_tag("book", name, b_identity)
-    bsum_path = os.path.join(out_dir, f"{btag}_metrics.json")
-    bsum = _load_cached(bsum_path, b_identity)
+    pre_b_identity = _cache_identity("book_backtest", model, base, **b_params)
+    pre_btag = _cache_tag("book", name, pre_b_identity)
+    pre_bsum_path = os.path.join(out_dir, f"{pre_btag}_metrics.json")
+    bsum = _load_cached(pre_bsum_path, pre_b_identity)
+    b_identity = pre_b_identity
     if bsum is None and not skip_book:
         from book import Book
 
+        pre_trace_path = os.path.join(out_dir, f"{pre_btag}_steps.jsonl")
         book_kwargs = {}
         if _accepts_kwarg(Book.__init__, "api_key"):
             book_kwargs["api_key"] = api_key
@@ -311,9 +321,15 @@ def run(
         if _accepts_kwarg(Book.__init__, "mark_frequency"):
             book_kwargs["mark_frequency"] = mark_frequency
         if _accepts_kwarg(Book.__init__, "trace_path"):
-            book_kwargs["trace_path"] = os.path.join(out_dir, f"{btag}_steps.jsonl")
+            book_kwargs["trace_path"] = pre_trace_path
         b = Book(base, model, start, end, step, **book_kwargs)
         bsum = b.run()
+        # Recompute provenance digest AFTER cache hydration/updates (OP08)
+        b_identity = _cache_identity("book_backtest", model, base, **b_params)
+        btag = _cache_tag("book", name, b_identity)
+        bsum_path = os.path.join(out_dir, f"{btag}_metrics.json")
+        if btag != pre_btag and os.path.exists(pre_trace_path):
+            os.replace(pre_trace_path, os.path.join(out_dir, f"{btag}_steps.jsonl"))
         _save_cached(bsum_path, bsum, b_identity)
         _write_json(os.path.join(out_dir, f"{btag}_equity.json"), b.equity_curve, indent=None)
     card["book_backtest"] = bsum
@@ -367,6 +383,7 @@ def _headline(card):
         "book_coverage_pct": bb.get("coverage_pct"),
         "book_valid_decisions": bb.get("valid_decisions"),
         "book_failed_steps": bb.get("failed_steps"),
+        "book_invalid_actions": bb.get("invalid_actions"),
         "book_deliberate_abstentions": bb.get("deliberate_abstentions"),
         "book_duration_days": bb.get("duration_days"),
         "book_cash_cagr_pct": bb.get("cash_comparator_cagr_pct"),
@@ -410,6 +427,28 @@ def _check_comparability(cards):
     }
     if len(windows) > 1:
         reasons.append(f"book date windows/cadences differ across cards: {sorted(windows)}")
+
+    mark_freqs = {
+        (c.get("config") or {}).get("mark_frequency")
+        for c in cards
+        if (c.get("config") or {}).get("mark_frequency") is not None
+    }
+    if len(mark_freqs) > 1:
+        reasons.append(f"book mark_frequency differs across cards: {sorted(mark_freqs)}")
+
+    stop_policies = {
+        (c.get("config") or {}).get("stop_policy")
+        for c in cards
+        if (c.get("config") or {}).get("stop_policy") is not None
+    }
+    if len(stop_policies) > 1:
+        reasons.append(f"construction stop_policy differs across cards: {sorted(stop_policies)}")
+
+    unverified_revs = [c["name"] for c in cards if not c.get("model_revision")]
+    if unverified_revs:
+        reasons.append(
+            f"unverified model_revision (alias-only build): {', '.join(unverified_revs)}"
+        )
 
     for track in ("construction_alpha", "book_backtest"):
         for field in ("code_digest", "prompt_digest", "data_digest"):
@@ -512,8 +551,10 @@ def demo():
             ab_rows = run_ab.run(setups)
             ab_summary = run_ab.summarize(ab_rows)
 
-            # Valid mock book run (deliberately opens long-dated call on strong momentum, else abstains)
+            # Valid mock book run (opens long-dated call when capacity/cash allows, else deliberately abstains)
             def _valid_responder(prompt, max_tokens=1200):
+                if "Open positions: 8/8" in prompt:
+                    return json.dumps({"close": [], "open": []})
                 return json.dumps({
                     "close": [],
                     "open": [{

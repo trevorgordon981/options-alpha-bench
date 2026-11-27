@@ -184,5 +184,219 @@ class TestMetricsAccuracyOP05(unittest.TestCase):
         self.assertEqual(stats["max_drawdown_pct"], 20.0)
 
 
+class TestChronologicalTimelineAndSemanticActionsOP09OP10(unittest.TestCase):
+    def test_future_exit_shock_never_changes_earlier_daily_mark_op10(self):
+        """OP10 exact counterfactual: Jan 6 crash stop-exit MUST NOT alter Jan 3 equity mark."""
+        base_dates = {
+            "2024-12-02": 100.0,
+            "2024-12-09": 102.0,
+            "2024-12-16": 104.0,
+            "2024-12-23": 103.0,
+            "2024-12-30": 105.0,
+            "2025-01-02": 100.0,  # Thu: entry
+            "2025-01-03": 115.0,  # Fri: strong rally (option gains materially)
+        }
+        spy_series = {**base_dates, "2025-01-06": 100.0}
+        nvda_shock = {**base_dates, "2025-01-06": 60.0}     # Mon: crash triggers -30% stop
+        nvda_no_shock = {**base_dates, "2025-01-06": 115.0} # Mon: flat, stays open
+
+        open_reply = (
+            '{"close": [], "open": [{"ticker": "NVDA", "direction": "long_call", '
+            '"entry_dte": 90, "long_delta": 0.60, "size_pct": 0.25}]}'
+        )
+
+        def _run_case(nvda_px, mark_frequency):
+            def _fake_get_closes(ticker, start, end):
+                src = spy_series if ticker.upper() == "SPY" else nvda_px
+                return {k: v for k, v in src.items() if start <= k <= end}
+
+            b = book.Book(
+                "http://127.0.0.1:8000",
+                "m",
+                start="2025-01-02",
+                end="2025-01-06",
+                step_days=7,
+                mark_frequency=mark_frequency,
+                verbose=False,
+                basket=["NVDA", "SPY"],
+            )
+            with mock.patch.object(book, "get_closes", side_effect=_fake_get_closes), \
+                 mock.patch("market.get_closes", side_effect=_fake_get_closes), \
+                 mock.patch.object(b, "_call", return_value=open_reply):
+                m = b.run()
+            return b, m
+
+        for freq in ("daily", "step"):
+            b_shock, _ = _run_case(nvda_shock, freq)
+            b_calm, _ = _run_case(nvda_no_shock, freq)
+
+            # Confirm the Jan 6 stop actually fired in the shock scenario and NOT in calm
+            self.assertEqual(len(b_shock.closed), 1)
+            self.assertEqual(b_shock.closed[0].exit_reason, "stop")
+            self.assertEqual(b_shock.closed[0].exit_date, "2025-01-06")
+            self.assertEqual(b_calm.closed[0].exit_reason, "final_liquidation")
+
+            daily_shock = dict(b_shock.daily_equity_curve)
+            daily_calm = dict(b_calm.daily_equity_curve)
+
+            # CRITICAL: Jan 3 mark MUST be identical regardless of the future Jan 6 shock!
+            self.assertIn("2025-01-03", daily_shock)
+            self.assertIn("2025-01-03", daily_calm)
+            self.assertEqual(daily_shock["2025-01-03"], daily_calm["2025-01-03"])
+            self.assertGreater(daily_shock["2025-01-03"], book.START_EQUITY)
+            self.assertLess(daily_shock["2025-01-06"], book.START_EQUITY)
+
+            # Direct point-in-time valuation check on Jan 3 (using only info available Jan 3)
+            pos = b_shock.positions[0]
+            cash_after_entry = book.START_EQUITY - pos.entry_cost_ps * 100 * pos.contracts
+            from datetime import date as _date
+            expected_jan3 = round(
+                cash_after_entry + pos.value_ps(115.0, _date(2025, 1, 3).toordinal()) * 100 * pos.contracts,
+                2,
+            )
+            self.assertAlmostEqual(daily_shock["2025-01-03"], expected_jan3, places=2)
+            if freq == "daily":
+                self.assertEqual(dict(b_shock.equity_curve)["2025-01-03"], expected_jan3)
+
+    def test_daily_mode_excludes_weekend_decision_and_end_marks_op05_op10(self):
+        """OP05/OP10 exact repro: 2-day cadence landing on Saturday 2025-01-04 must NOT pollute daily series."""
+        trading_px = {
+            "2025-01-02": 100.0,  # Thu
+            "2025-01-03": 101.0,  # Fri
+            "2025-01-06": 102.0,  # Mon
+        }
+
+        def _fake_get_closes(ticker, start, end):
+            return {k: v for k, v in trading_px.items() if start <= k <= end}
+
+        b = book.Book(
+            "http://127.0.0.1:8000",
+            "m",
+            start="2025-01-02",
+            end="2025-01-06",
+            step_days=2,  # Decision dates: Thu Jan 2, Sat Jan 4, Mon Jan 6
+            mark_frequency="daily",
+            verbose=False,
+            basket=["SPY"],
+        )
+        with mock.patch.object(book, "get_closes", side_effect=_fake_get_closes), \
+             mock.patch("market.get_closes", side_effect=_fake_get_closes), \
+             mock.patch.object(b, "_call", return_value='{"close": [], "open": []}'):
+            m = b.run()
+
+        self.assertEqual(m["periods_per_year"], 252.0)
+        self.assertEqual(m["sampling_frequency"], "daily_trading_sessions")
+        # Saturday 2025-01-04 MUST NOT appear in daily equity_curve or daily_equity_curve
+        eq_dates = [d for d, _ in b.equity_curve]
+        daily_dates = [d for d, _ in b.daily_equity_curve]
+        self.assertEqual(eq_dates, ["2025-01-02", "2025-01-03", "2025-01-06"])
+        self.assertEqual(daily_dates, ["2025-01-02", "2025-01-03", "2025-01-06"])
+        self.assertNotIn("2025-01-04", eq_dates)
+        self.assertNotIn("2025-01-04", daily_dates)
+        # Decision snapshots remain tracked separately
+        self.assertEqual([d for d, _ in b.decision_equity_curve], ["2025-01-02", "2025-01-04", "2025-01-06"])
+
+        # Weekend end date (Sunday 2025-01-05) must also be excluded in daily mode
+        b_wknd_end = book.Book(
+            "http://127.0.0.1:8000",
+            "m",
+            start="2025-01-02",
+            end="2025-01-05",
+            step_days=2,
+            mark_frequency="daily",
+            verbose=False,
+            basket=["SPY"],
+        )
+        with mock.patch.object(book, "get_closes", side_effect=_fake_get_closes), \
+             mock.patch("market.get_closes", side_effect=_fake_get_closes), \
+             mock.patch.object(b_wknd_end, "_call", return_value='{"close": [], "open": []}'):
+            b_wknd_end.run()
+        self.assertEqual([d for d, _ in b_wknd_end.equity_curve], ["2025-01-02", "2025-01-03"])
+        self.assertEqual([d for d, _ in b_wknd_end.daily_equity_curve], ["2025-01-02", "2025-01-03"])
+
+    def test_invalid_close_position_ids_rejected_as_unusable_actions_op09(self):
+        """OP09 exact repro: 3 replies closing 'never_opened' over falling SPY MUST fail validation."""
+        fake_spy = {
+            "2024-03-01": 100.0,
+            "2024-03-08": 99.0,
+            "2024-03-15": 98.0,
+        }
+        b = book.Book(
+            "http://127.0.0.1:8000",
+            "impossible-close-model",
+            start="2024-03-01",
+            end="2024-03-15",
+            step_days=7,
+            verbose=False,
+        )
+        with mock.patch.object(book, "get_closes", return_value=fake_spy), \
+             mock.patch("market.get_closes", return_value=fake_spy), \
+             mock.patch.object(b, "_call", return_value='{"close": ["never_opened"], "open": []}'):
+            m = b.run()
+
+        self.assertEqual(m["verdict"], "INVALID")
+        self.assertFalse(m["qualifying"])
+        self.assertEqual(m["decision_steps"], 3)
+        self.assertEqual(m["valid_decisions"], 0)
+        self.assertEqual(m["deliberate_abstentions"], 0)
+        self.assertEqual(m["invalid_actions"], 3)
+        self.assertEqual(m["failed_steps"], 3)
+        self.assertEqual(m["coverage_pct"], 0.0)
+        self.assertIsNone(m["alpha_vs_spy_cagr_pct"])
+        self.assertIsNone(m["cagr_pct"])
+        self.assertIsNone(m["sharpe"])
+        self.assertTrue(all(s["status"] == "invalid_action" for s in b.step_log))
+        self.assertTrue(all("never_opened" in s["error"] for s in b.step_log))
+
+    def test_unknown_ticker_duplicate_and_already_closed_id_rejected_op09(self):
+        fake_spy = {
+            "2024-02-01": 95.0,
+            "2024-02-08": 96.0,
+            "2024-02-15": 97.0,
+            "2024-02-22": 98.0,
+            "2024-03-01": 100.0,
+            "2024-03-08": 101.0,
+            "2024-03-15": 102.0,
+            "2024-03-22": 103.0,
+            "2024-03-29": 104.0,
+        }
+        b = book.Book(
+            "http://127.0.0.1:8000",
+            "mixed-action-model",
+            start="2024-03-01",
+            end="2024-03-29",
+            step_days=7,
+            verbose=False,
+            basket=["SPY"],
+        )
+        replies = [
+            # Step 1: unknown ticker -> invalid_action
+            '{"close": [], "open": [{"ticker": "NOT_IN_BASKET", "direction": "long_call", "entry_dte": 90, "long_delta": 0.6, "size_pct": 0.1}]}',
+            # Step 2: duplicate close id -> schema_fail
+            '{"close": ["p1", "p1"], "open": []}',
+            # Step 3: valid open p1 -> ok
+            '{"close": [], "open": [{"ticker": "SPY", "direction": "long_call", "entry_dte": 90, "long_delta": 0.6, "size_pct": 0.1}]}',
+            # Step 4: valid close p1 -> ok
+            '{"close": ["p1"], "open": []}',
+            # Step 5: re-closing already-closed p1 -> invalid_action
+            '{"close": ["p1"], "open": []}',
+        ]
+        with mock.patch.object(book, "get_closes", return_value=fake_spy), \
+             mock.patch("market.get_closes", return_value=fake_spy), \
+             mock.patch.object(b, "_call", side_effect=replies):
+            m = b.run()
+
+        self.assertEqual(m["decision_steps"], 5)
+        self.assertEqual(m["valid_decisions"], 2)
+        self.assertEqual(m["invalid_actions"], 2)
+        self.assertEqual(m["schema_fails"], 1)
+        self.assertEqual(m["failed_steps"], 3)
+        self.assertEqual(m["verdict"], "INVALID")  # 40% < 80% coverage
+        self.assertEqual(
+            [s["status"] for s in b.step_log],
+            ["invalid_action", "schema_fail", "ok", "ok", "invalid_action"],
+        )
+
+
 if __name__ == "__main__":
     unittest.main()

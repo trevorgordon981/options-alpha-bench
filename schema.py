@@ -149,7 +149,12 @@ def validate_book_open_spec(spec, *, valid_tickers=None) -> tuple[dict | None, s
     }, None
 
 
-def validate_book_decision(obj, *, valid_tickers=None) -> tuple[dict | None, str | None]:
+def validate_book_decision(
+    obj,
+    *,
+    valid_tickers=None,
+    open_position_ids=None,
+) -> tuple[dict | None, str | None]:
     """Strictly validate a book decision JSON object {'close': [...], 'open': [...]}."""
     if not isinstance(obj, dict):
         return None, f"expected JSON object, got {type(obj).__name__}"
@@ -160,10 +165,18 @@ def validate_book_decision(obj, *, valid_tickers=None) -> tuple[dict | None, str
     if not isinstance(raw_close, list):
         return None, f"'close' must be a list, got {type(raw_close).__name__}"
     closes = []
+    seen_closes = set()
+    open_id_set = set(open_position_ids) if open_position_ids is not None else None
     for idx, pid in enumerate(raw_close):
         if not isinstance(pid, str) or not pid.strip():
             return None, f"close[{idx}] must be a non-empty string, got {pid!r}"
-        closes.append(pid.strip())
+        pid_norm = pid.strip()
+        if pid_norm in seen_closes:
+            return None, f"close[{idx}]: duplicate position id {pid_norm!r}"
+        if open_id_set is not None and pid_norm not in open_id_set:
+            return None, f"close[{idx}]: unknown or non-open position id {pid_norm!r}"
+        seen_closes.add(pid_norm)
+        closes.append(pid_norm)
 
     raw_open = obj.get("open", [])
     if not isinstance(raw_open, list):
