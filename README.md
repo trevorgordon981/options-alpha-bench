@@ -10,19 +10,45 @@ periodic portfolio decisions over daily underlying close series.
 > counterfactual model comparisons and sensitivity studies — never as proof of
 > live tradable alpha or a pure single-Greek causal effect.
 
+## Prerequisites
+
+- **Python >= 3.11** (required for modern typing and stdlib behavior; stock macOS Python 3.9 is unsupported).
+- Offline tests and `bench.py demo` require **no external packages, network access, or API keys**.
+- Live market-data fetching (`run_ab.py` / uncached `bench.py run`) additionally requires `yfinance` (`pip install -r requirements.txt`).
+
 ## Reproducible offline demo (no network, no API keys)
 
-Run a complete, deterministic synthetic demonstration on the pinned fixture
-(`fixtures/sample_prices.json`) to verify the paired DTE A/B simulation, Greeks
-and strike-drift decomposition, valid mock-book scoring, and invalid-run gating:
+Create an isolated Python 3.11+ virtual environment and run the deterministic synthetic demonstration on the pinned fixture (`fixtures/sample_prices.json`) to verify the paired DTE A/B simulation, Greeks and strike-drift decomposition, valid mock-book scoring, and invalid-run gating:
 
 ```bash
+python3.11 -m venv .venv
+source .venv/bin/activate
 python bench.py demo
 ```
 
 The demo prints the SHA-256 hash of the pinned fixture, setup denominator,
 pricing decomposition, and both a qualifying (`verdict: "VALID"`) and an
 all-failed (`verdict: "INVALID"`, `alpha_vs_spy_cagr_pct: null`) book readout.
+
+## Measured Results
+
+Verified locally in an isolated `Python 3.11.14` virtual environment (stdlib only, no network or API keys):
+
+| Check / Command | Outcome | Wall Time |
+|---|---|---|
+| `python -m compileall -q .` | Passed | `0.072s` |
+| `python -m unittest discover -s tests -p "test_*.py" -v` | **48 / 48 tests passed** (`0.159s` unittest) | `0.229s` |
+| `python bench.py demo` | Passed (deterministic fixture `4131da77...2ea5e`) | `0.113s` |
+
+Key verified outputs from `python bench.py demo` on `fixtures/sample_prices.json` (`n_setups = 22`, synthetic constant-IV Black-Scholes daily-close simulation):
+
+- **Paired DTE A/B (`35 DTE` vs `8x` rule):**
+  - `doctrine_35dte`: mean `-8.75%`, median `-36.28%`, win rate `13.6%` (`18` stop / `4` horizon exits)
+  - `eightx_rule`: mean `-3.11%`, median `-9.86%`, win rate `27.3%` (`19` horizon / `3` stop exits)
+  - Paired delta (`8x - 35 DTE`): mean `+5.63%`, median `+16.59%`, `8x` better on `86.4%` of setups
+  - Pricing decomposition: median `|strike drift|` `3.57%` of spot, median entry cost ratio `2.278x`, median entry gamma `0.034891` (`35 DTE`) vs `0.015926` (`8x`), median daily theta `-0.0469` (`35 DTE`) vs `-0.014` (`8x`)
+- **Mock Book — valid run (`book_valid_mock`):** `verdict: "VALID"`, coverage `100.0%` over `184` days (`every_14_days`), CAGR `-21.4%`, Sharpe `0.29`, max drawdown `69.2%`, cash CAGR `0.0%`, SPY buy-and-hold CAGR `-18.5%`, alpha vs SPY `-2.9%`.
+- **Mock Book — all-failed run (`book_all_failed_mock`):** `verdict: "INVALID"` (`zero_valid_decisions (0/14)`), coverage `0.0%`, `14` transport errors, `alpha_vs_spy_cagr_pct: null`.
 
 ## The three tracks
 
